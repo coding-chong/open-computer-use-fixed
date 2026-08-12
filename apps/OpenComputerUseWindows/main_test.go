@@ -105,6 +105,29 @@ func TestGetAppStateSchemaIncludesTextLimit(t *testing.T) {
 	}
 }
 
+func TestGetAppStateSchemaIncludesIncludeImage(t *testing.T) {
+	tool := findToolDefinition(t, "get_app_state")
+	properties := tool.InputSchema["properties"].(map[string]any)
+	includeImage := properties["include_image"].(map[string]any)
+	if includeImage["type"] != "boolean" {
+		t.Fatalf("include_image type = %v, want boolean", includeImage["type"])
+	}
+	if _, ok := properties["max_tree_depth"]; !ok {
+		t.Fatal("get_app_state schema lost max_tree_depth")
+	}
+}
+
+func TestOptionalBool(t *testing.T) {
+	if got, err := optionalBool(map[string]any{}, "include_image"); err != nil || got {
+		t.Fatalf("missing bool = (%v, %v), want (false, nil)", got, err)
+	}
+	if got, err := optionalBool(map[string]any{"include_image": true}, "include_image"); err != nil || !got {
+		t.Fatalf("true bool = (%v, %v), want (true, nil)", got, err)
+	}
+	if _, err := optionalBool(map[string]any{"include_image": "true"}, "include_image"); err == nil {
+		t.Fatal("string bool should be rejected")
+	}
+}
 func TestParseSnapshotArgsSupportsTextLimit(t *testing.T) {
 	app, textLimit, maxTreeNodes, maxTreeDepth, err := parseSnapshotArgs([]string{"--text-limit", "1000", "Notepad"})
 	if err != nil {
@@ -267,6 +290,26 @@ func TestUTF8EncodingInPowerShellScript(t *testing.T) {
 	}
 }
 
+func TestWindowsRuntimeScreenshotCaptureContract(t *testing.T) {
+	for _, marker := range []string{
+		"[bool]$IncludeImage = $false",
+		"[OCUWin32]::PrintWindow",
+		"Test-BitmapHasVisiblePixels",
+		"Normalize-BitmapAlpha",
+		"CopyFromScreen",
+		"screenshotPngBase64 = Capture-WindowPngBase64 $bounds $process.MainWindowHandle $IncludeImage",
+	} {
+		if !strings.Contains(windowsRuntimeScript, marker) {
+			t.Fatalf("Windows screenshot contract missing %q", marker)
+		}
+	}
+	if !strings.Contains(windowsRuntimeScript, "Build-Snapshot $operation.app (Resolve-TextLimit $operation.text_limit) ([int]$operation.max_tree_nodes) ([int]$operation.max_tree_depth) ([bool]$operation.include_image)") {
+		t.Fatal("get_app_state include_image was not forwarded to Build-Snapshot")
+	}
+	if !strings.Contains(windowsRuntimeScript, "Build-Snapshot $operation.app $null $AccessibilityTreeMaxNodeCount $AccessibilityTreeMaxDepth $true") {
+		t.Fatal("action refreshes must retain screenshots")
+	}
+}
 func TestWindowsRuntimeTextLimitSupportsMaxMode(t *testing.T) {
 	if !strings.Contains(windowsRuntimeScript, "$DefaultTextLimit = 500") {
 		t.Fatal("Windows runtime should define the shared 500 character text limit")

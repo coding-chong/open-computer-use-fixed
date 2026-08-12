@@ -154,6 +154,7 @@ type psRequest struct {
 	TextLimit    any            `json:"text_limit,omitempty"`
 	MaxTreeNodes int            `json:"max_tree_nodes,omitempty"`
 	MaxTreeDepth int            `json:"max_tree_depth,omitempty"`
+	IncludeImage bool           `json:"include_image,omitempty"`
 }
 
 type textLimit struct {
@@ -200,7 +201,11 @@ func (s *service) callTool(name string, args map[string]any) toolCallResult {
 		if err != nil {
 			return textResult(err.Error(), true)
 		}
-		return s.getAppState(requiredString(args, "app"), textLimit, maxTreeNodes, maxTreeDepth)
+		includeImage, err := optionalBool(args, "include_image")
+		if err != nil {
+			return textResult(err.Error(), true)
+		}
+		return s.getAppState(requiredString(args, "app"), textLimit, maxTreeNodes, maxTreeDepth, includeImage)
 	case "click":
 		clickMethod, err := parseClickMethod(optionalString(args, "click_method"))
 		if err != nil {
@@ -261,11 +266,11 @@ func (s *service) listApps() toolCallResult {
 	return textResult(response.Text, false)
 }
 
-func (s *service) getAppState(app string, textLimit *textLimit, maxTreeNodes, maxTreeDepth *int) toolCallResult {
+func (s *service) getAppState(app string, textLimit *textLimit, maxTreeNodes, maxTreeDepth *int, includeImage bool) toolCallResult {
 	if app == "" {
 		return textResult("Missing required argument: app", true)
 	}
-	request := psRequest{Tool: "get_app_state", App: app}
+	request := psRequest{Tool: "get_app_state", App: app, IncludeImage: includeImage}
 	if textLimit != nil {
 		request.TextLimit = textLimit.runtimeValue()
 	}
@@ -436,6 +441,7 @@ func (s *service) setValue(app, elementIndex, value string) toolCallResult {
 }
 
 func (s *service) actionResult(app string, request psRequest) toolCallResult {
+	request.IncludeImage = true
 	snapshot, result := s.refreshSnapshot(app, request)
 	if result.IsError {
 		return result
@@ -599,6 +605,18 @@ func optionalFloat(args map[string]any, key string) *float64 {
 	return nil
 }
 
+func optionalBool(args map[string]any, key string) (bool, error) {
+	value, ok := args[key]
+	if !ok {
+		return false, nil
+	}
+	switch typed := value.(type) {
+	case bool:
+		return typed, nil
+	default:
+		return false, fmt.Errorf("%s must be a boolean", key)
+	}
+}
 func optionalTextLimit(args map[string]any, key string) (*textLimit, error) {
 	value, ok := args[key]
 	if !ok {
@@ -744,6 +762,7 @@ func toolDefinitions() []toolDefinition {
 				"text_limit":     textLimitProperty("Maximum text characters to return. Use \"max\" for full text. Defaults to 500."),
 				"max_tree_nodes": positiveIntegerProperty("Maximum accessibility tree nodes to render. Defaults to 1200."),
 				"max_tree_depth": positiveIntegerProperty("Maximum accessibility tree depth to render. Defaults to 64."),
+				"include_image":  booleanProperty("Include the screenshot image. Defaults to false; set true when visual pixels are needed."),
 			}, []string{"app"}),
 		},
 		{
@@ -834,6 +853,9 @@ func enumStringProperty(description string, values []string) map[string]any {
 	return property
 }
 
+func booleanProperty(description string) map[string]any {
+	return map[string]any{"type": "boolean", "description": description}
+}
 func numberProperty(description string) map[string]any {
 	return map[string]any{"type": "number", "description": description}
 }

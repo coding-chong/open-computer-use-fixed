@@ -49,6 +49,12 @@ public static class OCUWin32 {
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     public static extern IntPtr SendMessage(IntPtr hWnd, UInt32 msg, IntPtr wParam, string lParam);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint nFlags);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool IsWindow(IntPtr hWnd);
 }
 "@
 
@@ -562,23 +568,71 @@ function Render-Tree($element, $windowBounds, $TextLimit = $script:DefaultTextLi
     }
 }
 
-function Capture-WindowPngBase64($bounds) {
-    if ($null -eq $bounds -or $bounds.width -le 0 -or $bounds.height -le 0) {
+function Test-BitmapHasVisiblePixels($bitmap) {
+    $stepX = [Math]::Max(1, [int]($bitmap.Width / 32))
+    $stepY = [Math]::Max(1, [int]($bitmap.Height / 32))
+    for ($y = 0; $y -lt $bitmap.Height; $y += $stepY) {
+        for ($x = 0; $x -lt $bitmap.Width; $x += $stepX) {
+            $pixel = $bitmap.GetPixel($x, $y)
+            if ($pixel.A -gt 8 -and ($pixel.R -gt 8 -or $pixel.G -gt 8 -or $pixel.B -gt 8)) {
+                return $true
+            }
+        }
+    }
+    return $false
+}
+
+function Normalize-BitmapAlpha($bitmap) {
+    for ($y = 0; $y -lt $bitmap.Height; $y++) {
+        for ($x = 0; $x -lt $bitmap.Width; $x++) {
+            $pixel = $bitmap.GetPixel($x, $y)
+            if ($pixel.A -ne 255) {
+                $bitmap.SetPixel($x, $y, [System.Drawing.Color]::FromArgb(255, $pixel.R, $pixel.G, $pixel.B))
+            }
+        }
+    }
+}
+
+function Capture-WindowPngBase64($bounds, $hwnd, [bool]$IncludeImage) {
+    if (-not $IncludeImage -or $null -eq $bounds -or $bounds.width -le 0 -or $bounds.height -le 0) {
         return $null
     }
+    $bitmap = $null
+    $graphics = $null
     try {
-        $bitmap = New-Object System.Drawing.Bitmap ([int][math]::Round($bounds.width)), ([int][math]::Round($bounds.height))
+        $width = [int][math]::Round($bounds.width)
+        $height = [int][math]::Round($bounds.height)
+        $bitmap = New-Object System.Drawing.Bitmap $width, $height, ([System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
         $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-        $graphics.CopyFromScreen([int][math]::Round($bounds.x), [int][math]::Round($bounds.y), 0, 0, $bitmap.Size)
+        $graphics.Clear([System.Drawing.Color]::Black)
+        $captured = $false
+        if ($null -ne $hwnd -and [OCUWin32]::IsWindow([IntPtr]$hwnd)) {
+            $hdc = $graphics.GetHdc()
+            try {
+                $captured = [OCUWin32]::PrintWindow([IntPtr]$hwnd, $hdc, 0)
+            } finally {
+                $graphics.ReleaseHdc($hdc)
+            }
+        }
+        if (-not $captured -or -not (Test-BitmapHasVisiblePixels $bitmap)) {
+            $graphics.CopyFromScreen([int][math]::Round($bounds.x), [int][math]::Round($bounds.y), 0, 0, $bitmap.Size)
+        }
+        if (-not (Test-BitmapHasVisiblePixels $bitmap)) {
+            return $null
+        }
+        Normalize-BitmapAlpha $bitmap
         $stream = New-Object System.IO.MemoryStream
-        $bitmap.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
-        $graphics.Dispose()
-        $bitmap.Dispose()
-        $bytes = $stream.ToArray()
-        $stream.Dispose()
-        return [Convert]::ToBase64String($bytes)
+        try {
+            $bitmap.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
+            return [Convert]::ToBase64String($stream.ToArray())
+        } finally {
+            $stream.Dispose()
+        }
     } catch {
         return $null
+    } finally {
+        if ($null -ne $graphics) { $graphics.Dispose() }
+        if ($null -ne $bitmap) { $bitmap.Dispose() }
     }
 }
 
@@ -615,7 +669,7 @@ function Get-SelectedText($processId, $TextLimit = $script:DefaultTextLimit) {
     return $null
 }
 
-function Build-Snapshot([string]$query, $TextLimit = $script:DefaultTextLimit, [int]$MaxTreeNodes = $script:AccessibilityTreeMaxNodeCount, [int]$MaxTreeDepth = $script:AccessibilityTreeMaxDepth) {
+function Build-Snapshot([string]$query, $TextLimit = $script:DefaultTextLimit, [int]$MaxTreeNodes = $script:AccessibilityTreeMaxNodeCount, [int]$MaxTreeDepth = $script:AccessibilityTreeMaxDepth, [bool]$IncludeImage = $false) {
     $process = Resolve-App $query
     $element = Get-MainElement $process
     $bounds = Get-WindowBounds $process $element
@@ -628,7 +682,7 @@ function Build-Snapshot([string]$query, $TextLimit = $script:DefaultTextLimit, [
         }
         windowTitle = Limit-Text $process.MainWindowTitle $TextLimit
         windowBounds = $bounds
-        screenshotPngBase64 = Capture-WindowPngBase64 $bounds
+        screenshotPngBase64 = Capture-WindowPngBase64 $bounds $process.MainWindowHandle $IncludeImage
         treeLines = @($rendered.lines)
         focusedSummary = Get-FocusedSummary $process.Id $TextLimit
         selectedText = Get-SelectedText $process.Id $TextLimit
@@ -902,7 +956,7 @@ try {
     if ($operation.tool -eq "list_apps") {
         $response = [pscustomobject]@{ ok = $true; text = (List-Apps) }
     } elseif ($operation.tool -eq "get_app_state") {
-        $response = [pscustomobject]@{ ok = $true; snapshot = (Build-Snapshot $operation.app (Resolve-TextLimit $operation.text_limit) ([int]$operation.max_tree_nodes) ([int]$operation.max_tree_depth)) }
+        $response = [pscustomobject]@{ ok = $true; snapshot = (Build-Snapshot $operation.app (Resolve-TextLimit $operation.text_limit) ([int]$operation.max_tree_nodes) ([int]$operation.max_tree_depth) ([bool]$operation.include_image)) }
     } else {
         $process = Resolve-App $operation.app
         $hwnd = [IntPtr]$process.MainWindowHandle
@@ -995,7 +1049,7 @@ try {
         }
 
         Start-Sleep -Milliseconds 120
-        $response = [pscustomobject]@{ ok = $true; snapshot = (Build-Snapshot $operation.app) }
+        $response = [pscustomobject]@{ ok = $true; snapshot = (Build-Snapshot $operation.app $null $AccessibilityTreeMaxNodeCount $AccessibilityTreeMaxDepth $true) }
     }
 } catch {
     $message = $_.Exception.Message
