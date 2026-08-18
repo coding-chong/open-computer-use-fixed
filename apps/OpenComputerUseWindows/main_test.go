@@ -8,8 +8,8 @@ import (
 )
 
 func TestToolDefinitionCount(t *testing.T) {
-	if got := len(toolDefinitions()); got != 9 {
-		t.Fatalf("toolDefinitions() count = %d, want 9", got)
+	if got := len(toolDefinitions()); got != 10 {
+		t.Fatalf("toolDefinitions() count = %d, want 10", got)
 	}
 }
 
@@ -114,6 +114,28 @@ func TestGetAppStateSchemaIncludesIncludeImage(t *testing.T) {
 	}
 	if _, ok := properties["max_tree_depth"]; !ok {
 		t.Fatal("get_app_state schema lost max_tree_depth")
+	}
+}
+
+func TestSaveScreenshotSchema(t *testing.T) {
+	tool := findToolDefinition(t, "save_screenshot")
+	properties := tool.InputSchema["properties"].(map[string]any)
+	if properties["app"].(map[string]any)["type"] != "string" {
+		t.Fatal("save_screenshot app must be a string")
+	}
+	if properties["path"].(map[string]any)["type"] != "string" {
+		t.Fatal("save_screenshot path must be a string")
+	}
+	required := tool.InputSchema["required"].([]string)
+	if strings.Join(required, ",") != "app,path" {
+		t.Fatalf("save_screenshot required = %#v, want [app path]", required)
+	}
+}
+
+func TestSaveScreenshotRejectsRelativePath(t *testing.T) {
+	result := newService().saveScreenshot("msedge", "desktop.png")
+	if !result.IsError || result.Content[0].Text != "save_screenshot path must be absolute" {
+		t.Fatalf("relative save_screenshot result = %#v", result)
 	}
 }
 

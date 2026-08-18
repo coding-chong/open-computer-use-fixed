@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	_ "embed"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,7 +25,7 @@ var clickMethodValues = []string{"auto", "accessibility", "app_post", "sky_click
 //go:embed runtime.ps1
 var windowsRuntimeScript string
 
-const serverInstructions = "Computer Use tools let you interact with Windows apps by performing UI actions.\n\nBegin by calling `get_app_state` every turn you want to use Computer Use to get the latest state before acting. The available tools are list_apps, get_app_state, click, perform_secondary_action, scroll, drag, type_text, press_key, and set_value.\n\nPrefer element-targeted interactions over coordinate clicks when an index for the targeted element is available. Windows actions use UI Automation patterns first and fall back to window messages when an app does not expose the needed pattern. The Windows runtime does not auto-launch apps, perform SetFocus, or use UIA text fallback by default, so background-capable actions do not intentionally steal the user's foreground focus."
+const serverInstructions = "Computer Use tools let you interact with Windows apps by performing UI actions.\n\nBegin by calling `get_app_state` every turn you want to use Computer Use to get the latest state before acting. The available tools are list_apps, get_app_state, save_screenshot, click, perform_secondary_action, scroll, drag, type_text, press_key, and set_value.\n\nWhen visual pixels are needed, call get_app_state with include_image=true; its result contains an image/png content block. When the user asks to save that screenshot to a file, call save_screenshot instead of using PowerShell or taking a second screenshot.\n\nPrefer element-targeted interactions over coordinate clicks when an index for the targeted element is available. Windows actions use UI Automation patterns first and fall back to window messages when an app does not expose the needed pattern. The Windows runtime does not auto-launch apps, perform SetFocus, or use UIA text fallback by default, so background-capable actions do not intentionally steal the user's foreground focus."
 
 type toolDefinition struct {
 	Name        string         `json:"name"`
@@ -206,6 +207,8 @@ func (s *service) callTool(name string, args map[string]any) toolCallResult {
 			return textResult(err.Error(), true)
 		}
 		return s.getAppState(requiredString(args, "app"), textLimit, maxTreeNodes, maxTreeDepth, includeImage)
+	case "save_screenshot":
+		return s.saveScreenshot(requiredString(args, "app"), requiredString(args, "path"))
 	case "click":
 		clickMethod, err := parseClickMethod(optionalString(args, "click_method"))
 		if err != nil {
@@ -285,6 +288,34 @@ func (s *service) getAppState(app string, textLimit *textLimit, maxTreeNodes, ma
 		return result
 	}
 	return snapshot.result()
+}
+
+func (s *service) saveScreenshot(app, path string) toolCallResult {
+	if app == "" {
+		return textResult("Missing required argument: app", true)
+	}
+	if path == "" {
+		return textResult("Missing required argument: path", true)
+	}
+	path = filepath.Clean(path)
+	if !filepath.IsAbs(path) {
+		return textResult("save_screenshot path must be absolute", true)
+	}
+	snapshot, result := s.refreshSnapshot(app, psRequest{Tool: "get_app_state", App: app, IncludeImage: true})
+	if result.IsError {
+		return result
+	}
+	if snapshot.ScreenshotPNGBase64 == "" {
+		return textResult("Windows runtime did not return screenshot image data.", true)
+	}
+	data, err := base64.StdEncoding.DecodeString(snapshot.ScreenshotPNGBase64)
+	if err != nil {
+		return textResult(fmt.Sprintf("Invalid screenshot PNG data: %v", err), true)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return textResult(fmt.Sprintf("Unable to save screenshot to %s: %v", path, err), true)
+	}
+	return textResult(fmt.Sprintf("Screenshot saved to %s (%d bytes).", path, len(data)), false)
 }
 
 func (s *service) click(app, elementIndex string, x, y *float64, clickCount int, mouseButton, clickMethod string) toolCallResult {
@@ -770,6 +801,15 @@ func toolDefinitions() []toolDefinition {
 			Description: "List the apps on this computer. Returns the set of apps that are currently running, as well as any that have been used in the last 14 days, including details on usage frequency. This tool is part of plugin `Computer Use`.",
 			Annotations: readOnlyAnnotations(),
 			InputSchema: objectSchema(map[string]any{}, nil),
+		},
+		{
+			Name:        "save_screenshot",
+			Description: "Capture the key window of an already running Windows app and save the PNG to an absolute file path. Use this when the user asks to save or export the screenshot; it captures fresh pixels and does not require the AI to decode an image content block.",
+			Annotations: defaultAnnotations(),
+			InputSchema: objectSchema(map[string]any{
+				"app":  stringProperty("App name or bundle identifier"),
+				"path": stringProperty("Absolute destination path for the PNG file"),
+			}, []string{"app", "path"}),
 		},
 		{
 			Name:        "perform_secondary_action",
