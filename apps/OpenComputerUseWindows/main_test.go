@@ -117,6 +117,35 @@ func TestGetAppStateSchemaIncludesIncludeImage(t *testing.T) {
 	}
 }
 
+func TestModelVisionToolSelectionContract(t *testing.T) {
+	for _, phrase := range []string{
+		"`get_app_state` with `include_image=true`",
+		"model-visible screenshot",
+		"Do not use `press_key` to simulate PrintScreen, Win+Shift+S",
+		"successful action already returns a refreshed screenshot",
+		"`save_screenshot` only when the user asks to save or export a PNG file",
+	} {
+		if !strings.Contains(serverInstructions, phrase) {
+			t.Fatalf("server instructions missing %q", phrase)
+		}
+	}
+
+	state := findToolDefinition(t, "get_app_state")
+	if !strings.Contains(state.Description, "model-visible screenshot") || !strings.Contains(state.Description, "screenshot shortcuts") {
+		t.Fatalf("get_app_state description does not define visual inspection: %q", state.Description)
+	}
+	stateProperties := state.InputSchema["properties"].(map[string]any)
+	includeImage := stateProperties["include_image"].(map[string]any)
+	if !strings.Contains(includeImage["description"].(string), "model-visible screenshot") || !strings.Contains(includeImage["description"].(string), "press_key") {
+		t.Fatalf("include_image description does not define the vision route: %q", includeImage["description"])
+	}
+
+	export := findToolDefinition(t, "save_screenshot")
+	if !strings.Contains(export.Description, "only when the user asks to save or export") || !strings.Contains(export.Description, "get_app_state with include_image=true") {
+		t.Fatalf("save_screenshot description does not distinguish export from model vision: %q", export.Description)
+	}
+}
+
 func TestSaveScreenshotSchema(t *testing.T) {
 	tool := findToolDefinition(t, "save_screenshot")
 	properties := tool.InputSchema["properties"].(map[string]any)

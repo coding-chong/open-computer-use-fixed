@@ -25,7 +25,7 @@ var clickMethodValues = []string{"auto", "accessibility", "app_post", "sky_click
 //go:embed runtime.ps1
 var windowsRuntimeScript string
 
-const serverInstructions = "Computer Use tools let you interact with Windows apps by performing UI actions.\n\nBegin by calling `get_app_state` every turn you want to use Computer Use to get the latest state before acting. The available tools are list_apps, get_app_state, save_screenshot, click, perform_secondary_action, scroll, drag, type_text, press_key, and set_value.\n\nWhen visual pixels are needed, call get_app_state with include_image=true; its result contains an image/png content block. When the user asks to save that screenshot to a file, call save_screenshot instead of using PowerShell or taking a second screenshot.\n\nPrefer element-targeted interactions over coordinate clicks when an index for the targeted element is available. Windows actions use UI Automation patterns first and fall back to window messages when an app does not expose the needed pattern. The Windows runtime does not auto-launch apps, perform SetFocus, or use UIA text fallback by default, so background-capable actions do not intentionally steal the user's foreground focus."
+const serverInstructions = "Computer Use tools let you interact with Windows apps by performing UI actions.\n\nBegin by calling `get_app_state` every turn you want to use Computer Use to get the latest state before acting. The available tools are list_apps, get_app_state, save_screenshot, click, perform_secondary_action, scroll, drag, type_text, press_key, and set_value.\n\nTo inspect or understand visual pixels, call `get_app_state` with `include_image=true`; its image/png result is the model-visible screenshot. Do not use `press_key` to simulate PrintScreen, Win+Shift+S, or another operating-system screenshot shortcut. A successful action already returns a refreshed screenshot when available, so use that result rather than taking a second screenshot. Use `save_screenshot` only when the user asks to save or export a PNG file.\n\nPrefer element-targeted interactions over coordinate clicks when an index for the targeted element is available. Windows actions use UI Automation patterns first and fall back to window messages when an app does not expose the needed pattern. The Windows runtime does not auto-launch apps, perform SetFocus, or use UIA text fallback by default, so background-capable actions do not intentionally steal the user's foreground focus."
 
 type toolDefinition struct {
 	Name        string         `json:"name"`
@@ -786,14 +786,14 @@ func toolDefinitions() []toolDefinition {
 		},
 		{
 			Name:        "get_app_state",
-			Description: "Get the state of an already running app's key window and return a screenshot and accessibility tree. This must be called once per assistant turn before interacting with the app. This tool is part of plugin `Computer Use`.",
+			Description: "Get the state of an already running app's key window and return its accessibility tree. Set include_image=true to inspect the current screen through a model-visible screenshot; do not simulate operating-system screenshot shortcuts with press_key. This must be called once per assistant turn before interacting with the app. This tool is part of plugin `Computer Use`.",
 			Annotations: readOnlyAnnotations(),
 			InputSchema: objectSchema(map[string]any{
 				"app":            stringProperty("App name or bundle identifier"),
 				"text_limit":     textLimitProperty("Maximum text characters to return. Use \"max\" for full text. Defaults to 500."),
 				"max_tree_nodes": positiveIntegerProperty("Maximum accessibility tree nodes to render. Defaults to 1200."),
 				"max_tree_depth": positiveIntegerProperty("Maximum accessibility tree depth to render. Defaults to 64."),
-				"include_image":  booleanProperty("Include the screenshot image. Defaults to false; set true when visual pixels are needed."),
+				"include_image":  booleanProperty("Include a model-visible screenshot for visual inspection. Defaults to false; set true to inspect pixels instead of using press_key for an operating-system screenshot shortcut."),
 			}, []string{"app"}),
 		},
 		{
@@ -804,7 +804,7 @@ func toolDefinitions() []toolDefinition {
 		},
 		{
 			Name:        "save_screenshot",
-			Description: "Capture the key window of an already running Windows app and save the PNG to an absolute file path. Use this when the user asks to save or export the screenshot; it captures fresh pixels and does not require the AI to decode an image content block.",
+			Description: "Capture the key window of an already running Windows app and save the PNG to an absolute file path. Use this only when the user asks to save or export the screenshot; use get_app_state with include_image=true to inspect pixels in the model.",
 			Annotations: defaultAnnotations(),
 			InputSchema: objectSchema(map[string]any{
 				"app":  stringProperty("App name or bundle identifier"),
