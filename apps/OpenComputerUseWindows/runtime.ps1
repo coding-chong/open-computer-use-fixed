@@ -464,6 +464,47 @@ function Get-ScreenPoint($localFrame, $windowBounds) {
     }
 }
 
+function Get-ValidatedScrollFallbackPoint($elementRecord, $windowBounds) {
+    $errorMessage = "Scroll requires an element with a valid frame when ScrollPattern is unavailable."
+    if ($null -eq $elementRecord) {
+        throw $errorMessage
+    }
+
+    $frame = $elementRecord.frame
+    if ($null -eq $frame -or $null -eq $windowBounds) {
+        throw $errorMessage
+    }
+    if ($null -eq $frame.x -or $null -eq $frame.y -or $null -eq $frame.width -or $null -eq $frame.height) {
+        throw $errorMessage
+    }
+
+    try {
+        $values = @(
+            [double]$frame.x
+            [double]$frame.y
+            [double]$frame.width
+            [double]$frame.height
+        )
+    } catch {
+        throw $errorMessage
+    }
+
+    foreach ($value in $values) {
+        if ([double]::IsNaN($value) -or [double]::IsInfinity($value)) {
+            throw $errorMessage
+        }
+    }
+    if ($values[2] -le 0 -or $values[3] -le 0) {
+        throw $errorMessage
+    }
+
+    $point = Get-ScreenPoint $frame $windowBounds
+    if ($null -eq $point) {
+        throw $errorMessage
+    }
+    return $point
+}
+
 function ConvertTo-AbsolutePointerPoint([int]$screenX, [int]$screenY) {
     $left = [OCUWin32]::GetSystemMetrics($SM_XVIRTUALSCREEN)
     $top = [OCUWin32]::GetSystemMetrics($SM_YVIRTUALSCREEN)
@@ -1591,7 +1632,7 @@ try {
                 }
                 if (-not $handled) {
                     Assert-SnapshotCoordinateBounds $hwnd $windowBounds
-                    $point = Get-ScreenPoint $operation.element.frame $windowBounds
+                    $point = Get-ValidatedScrollFallbackPoint $operation.element $windowBounds
                     Send-Scroll $process $hwnd $point.x $point.y $operation.direction ([double]$operation.pages)
                 }
             }

@@ -165,6 +165,55 @@ func TestWindowsRuntimeGuardsCoordinateAndAppScopedMessagePaths(t *testing.T) {
 	}
 }
 
+func TestWindowsScrollFallbackValidatesFrameBeforeDelivery(t *testing.T) {
+	const helperStartMarker = "function Get-ValidatedScrollFallbackPoint($elementRecord, $windowBounds)"
+	helperStart := strings.Index(windowsRuntimeScript, helperStartMarker)
+	if helperStart < 0 {
+		t.Fatal("scroll fallback frame-validation helper is missing")
+	}
+	helperEndOffset := strings.Index(windowsRuntimeScript[helperStart:], "function ConvertTo-AbsolutePointerPoint")
+	if helperEndOffset < 0 {
+		t.Fatal("could not bound scroll fallback frame-validation helper")
+	}
+	helper := windowsRuntimeScript[helperStart : helperStart+helperEndOffset]
+	for _, marker := range []string{
+		"Scroll requires an element with a valid frame when ScrollPattern is unavailable.",
+		"if ($null -eq $elementRecord)",
+		"$null -eq $frame.x",
+		"[double]::IsNaN",
+		"[double]::IsInfinity",
+		"$values[2] -le 0 -or $values[3] -le 0",
+		"Get-ScreenPoint $frame $windowBounds",
+	} {
+		if !strings.Contains(helper, marker) {
+			t.Fatalf("scroll fallback frame validation missing %q", marker)
+		}
+	}
+
+	scrollStart := strings.Index(windowsRuntimeScript, `"scroll" {`)
+	if scrollStart < 0 {
+		t.Fatal("could not find scroll dispatch branch")
+	}
+	scrollEndOffset := strings.Index(windowsRuntimeScript[scrollStart:], `"drag" {`)
+	if scrollEndOffset < 0 {
+		t.Fatal("could not bound scroll dispatch branch")
+	}
+	scrollBranch := windowsRuntimeScript[scrollStart : scrollStart+scrollEndOffset]
+	invokeOffset := strings.Index(scrollBranch, "Invoke-Scroll")
+	boundsOffset := strings.Index(scrollBranch, "Assert-SnapshotCoordinateBounds $hwnd $windowBounds")
+	pointOffset := strings.Index(scrollBranch, "Get-ValidatedScrollFallbackPoint $operation.element $windowBounds")
+	sendOffset := strings.Index(scrollBranch, "Send-Scroll $process $hwnd $point.x $point.y")
+	if invokeOffset < 0 || boundsOffset < 0 || pointOffset < 0 || sendOffset < 0 {
+		t.Fatal("scroll dispatch is missing semantic, bounds, frame, or delivery stages")
+	}
+	if invokeOffset > pointOffset || boundsOffset > pointOffset || pointOffset > sendOffset {
+		t.Fatal("scroll fallback validation is not ordered before coordinate/message delivery")
+	}
+	if strings.Contains(scrollBranch, "$operation.element.frame") {
+		t.Fatal("scroll dispatch must not dereference the optional frame directly")
+	}
+}
+
 func TestGetAppStateSchemaIncludesTextLimit(t *testing.T) {
 	tool := findToolDefinition(t, "get_app_state")
 	properties := tool.InputSchema["properties"].(map[string]any)

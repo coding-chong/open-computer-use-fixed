@@ -199,6 +199,53 @@ try {
     Assert-Condition ((-not $staleResult.ok) -and $staleResult.error -like '*Target changed; call get_app_state again.*') 'Stale bounds were not rejected.'
     $snapshotA = Get-Snapshot $stateA.title
 
+    $semanticScrollElement = Find-Element $snapshotA 'Scroll test container' 'Scroll' $false
+    Assert-Condition ($null -ne $semanticScrollElement) 'The WPF ScrollViewer did not expose ScrollPattern.'
+    $semanticScrollWithoutFrame = $semanticScrollElement | ConvertTo-Json -Depth 50 | ConvertFrom-Json
+    $semanticScrollWithoutFrame.frame = $null
+    $beforeSemanticScroll = Read-State $targetA.StatePath
+    $semanticScrollResult = Invoke-Runtime ([pscustomobject]@{
+        tool = 'scroll'; app = $stateA.title; element = $semanticScrollWithoutFrame; direction = 'down'; pages = 1
+        windowBounds = $snapshotA.windowBounds; expectedPid = [int]$snapshotA.app.pid
+        expectedProcessStartTimeTicks = [int64]$snapshotA.app.processStartTimeTicks; expectedMainWindowHandle = [int64]$snapshotA.app.mainWindowHandle
+    })
+    Assert-Condition $semanticScrollResult.ok ('Semantic scroll without a frame failed: ' + $semanticScrollResult.error)
+    Start-Sleep -Milliseconds 200
+    $afterSemanticScroll = Read-State $targetA.StatePath
+    Assert-Condition ($afterSemanticScroll.scrollEvents -gt $beforeSemanticScroll.scrollEvents) 'Semantic scroll without a frame did not change the ScrollViewer.'
+
+    $scrollFallbackElement = Find-Element $snapshotA 'Auto click target' 'Invoke' $false
+    Assert-Condition ($null -ne $scrollFallbackElement -and $null -ne $scrollFallbackElement.frame) 'The fallback scroll target was not found with a frame.'
+    Assert-Condition (-not ($scrollFallbackElement.actions -contains 'Scroll')) 'The fallback scroll target unexpectedly exposes ScrollPattern.'
+    $validFallbackResult = Invoke-Runtime ([pscustomobject]@{
+        tool = 'scroll'; app = $stateA.title; element = $scrollFallbackElement; direction = 'down'; pages = 1
+        windowBounds = $snapshotA.windowBounds; expectedPid = [int]$snapshotA.app.pid
+        expectedProcessStartTimeTicks = [int64]$snapshotA.app.processStartTimeTicks; expectedMainWindowHandle = [int64]$snapshotA.app.mainWindowHandle
+    })
+    Assert-Condition $validFallbackResult.ok ('Valid-frame scroll fallback failed: ' + $validFallbackResult.error)
+
+    $beforeInvalidScrollFrame = Read-State $targetA.StatePath
+    $missingFrameElement = $scrollFallbackElement | ConvertTo-Json -Depth 50 | ConvertFrom-Json
+    $missingFrameElement.frame = $null
+    $missingFrameResult = Invoke-Runtime ([pscustomobject]@{
+        tool = 'scroll'; app = $stateA.title; element = $missingFrameElement; direction = 'down'; pages = 1
+        windowBounds = $snapshotA.windowBounds; expectedPid = [int]$snapshotA.app.pid
+        expectedProcessStartTimeTicks = [int64]$snapshotA.app.processStartTimeTicks; expectedMainWindowHandle = [int64]$snapshotA.app.mainWindowHandle
+    })
+    Assert-Condition ((-not $missingFrameResult.ok) -and $missingFrameResult.error -like 'Scroll requires an element with a valid frame when ScrollPattern is unavailable.*') 'Missing scroll frame was not rejected with the bounded error.'
+
+    $zeroWidthFrameElement = $scrollFallbackElement | ConvertTo-Json -Depth 50 | ConvertFrom-Json
+    $zeroWidthFrameElement.frame.width = 0
+    $zeroWidthFrameResult = Invoke-Runtime ([pscustomobject]@{
+        tool = 'scroll'; app = $stateA.title; element = $zeroWidthFrameElement; direction = 'down'; pages = 1
+        windowBounds = $snapshotA.windowBounds; expectedPid = [int]$snapshotA.app.pid
+        expectedProcessStartTimeTicks = [int64]$snapshotA.app.processStartTimeTicks; expectedMainWindowHandle = [int64]$snapshotA.app.mainWindowHandle
+    })
+    Assert-Condition ((-not $zeroWidthFrameResult.ok) -and $zeroWidthFrameResult.error -like 'Scroll requires an element with a valid frame when ScrollPattern is unavailable.*') 'Non-positive scroll frame was not rejected with the bounded error.'
+    Start-Sleep -Milliseconds 200
+    $afterInvalidScrollFrame = Read-State $targetA.StatePath
+    Assert-Condition ($afterInvalidScrollFrame.scrollEvents -eq $beforeInvalidScrollFrame.scrollEvents) 'Invalid scroll frame changed the ScrollViewer.'
+
     $savedNames = @{}
     $negativeNames = @('OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT', 'OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS')
     foreach ($name in $negativeNames) {
@@ -264,6 +311,9 @@ try {
         identityPinned = $true
         mismatchRejected = $true
         staleBoundsRejected = $true
+        semanticScrollWithoutFrame = $true
+        validFrameScrollFallback = $true
+        invalidScrollFramesRejected = $true
         unauthorizedGlobalAndKeyboardRejected = $true
         wpfAppPostCapabilityError = $true
         nativeOutsideAppPostRejected = $true
