@@ -16,7 +16,7 @@
   - 替换 macOS Swift 主线。
   - Windows installer、code signing。
   - visual cursor overlay。
-  - 完整 Windows fixture / smoke suite。
+  - 面向第三方应用的完整 Windows smoke suite。
 
 ## 背景
 
@@ -32,8 +32,8 @@
 - 已知约束：
   - Windows UI Automation 需要 runtime 运行在已登录桌面 session；脱离桌面的 SSH/service 进程可能看不到顶层窗口。
   - 第一版以 Go 生成 `.exe` 为交付边界，但 UIA 操作通过嵌入式 PowerShell bridge 调 Windows 内置 .NET UI Automation API。
-  - Win32 window message fallback 能减少真实鼠标抢占，但不同 GUI toolkit 对后台消息支持不一致。
-  - Windows 没有一套对任意 app 都等价于 macOS AX 的后台键鼠模型；当前策略是 UIA pattern 优先、window message best-effort，并把启动 app / `SetFocus` / UIA text fallback 这类前台抢占路径做成显式 opt-in。
+  - Win32 window message fallback 能减少真实鼠标抢占，但不同 GUI toolkit 对后台消息支持不一致；strict `app_post` 只面向同进程 native HWND，WPF/no-child-HWND 必须返回 capability error。
+  - Windows 没有一套对任意 app 都等价于 macOS AX 的后台键鼠模型；当前策略是 UIA pattern 优先、window message best-effort（drag 保留该背景 fallback），而 `press_key` 只在显式前台授权后走 `SendInput`，未授权时 fail closed；已授权的真实 pointer/keyboard 输入限定在 `SendInput` 路径。该路径须验证窗口归属或 foreground ownership，且默认关闭。
 
 ## 风险
 
@@ -77,8 +77,12 @@
 - [x] 收紧 Windows 后台运行默认策略：找不到 app 时不再自动启动，`SetFocus` 默认禁用，只能通过环境变量显式开启。
 - [x] 将 `type_text` 默认路径从 UIA `ValuePattern.SetValue` 改为 child HWND `EM_SETSEL` / `EM_REPLACESEL` 优先；可能把 app 带到前台的 UIA text fallback 改成环境变量显式开启。
 - [x] 通过交互式 Windows scheduled task 验证新 `type_text` 路径：`get_app_state -> type_text -> get_app_state` 三步均 `isError=false`，Notepad 文本包含 `bgmsg-*` marker，前台窗口调用前后均为 Codex。
+- [x] 增加 `apps/OpenComputerUseWindows/fixtures/` 中可观察的 WPF 和 WinForms 夹具，覆盖 9-tool 交互路径及 native HWND app-post 计数器。
+- [x] 对 explicit opt-in `global` click、drag 和授权 `press_key` 添加 DPI-aware `SendInput` 路径；pointer 验证请求坐标处的窗口归属，keyboard 验证 foreground ownership，并以明确错误保留 foreground/UIPI 限制。
+- [x] 修正 `press_key` 未授权分支：没有 `OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT=1` 时在发送任何键消息前 fail closed；补充 Go 嵌入式 runtime 回归断言。
+- [x] 收紧 `app_post`：WPF/no-child-HWND 返回 capability error；native button 使用 `BM_CLICK`，不静默变为 global input。
 - [ ] 在交互式 Windows 桌面 session 补 Notepad / Edge 等真实 UI action smoke。
-- [ ] 增加 Windows fixture 和可重复 smoke runner。
+- [x] 增加 Windows fixture；[x] 增加 opt-in WPF identity/bounds smoke test（双实例、snapshot identity、窗口移动后的 stale bounds）；[x] 增加 PowerShell 7 deterministic safety runner（WPF/WinForms、授权负例、strict app_post）；[ ] 扩展 runner 覆盖完整 action matrix。
 - [ ] 评估用 `PrintWindow` / Windows Graphics Capture 补一条不依赖窗口可见性的 background screenshot 路径。
 - [ ] 为必须依赖前台输入的 app/toolkit 场景补更明确的 capability/error，避免静默退到抢焦点行为。
 - [x] 将 Windows artifact 接入 npm release packaging，作为既有 npm root/alias packages 的 bundled artifacts 分发。
@@ -97,3 +101,7 @@
 - 2026-04-22：Notepad 实测反馈 `type_text` 的 UIA `ValuePattern.SetValue` 会把窗口带到前台；默认改为 child HWND `EM_REPLACESEL` 后台消息路径，旧 UIA fallback 需要 `OPEN_COMPUTER_USE_WINDOWS_ALLOW_UIA_TEXT_FALLBACK=1`。
 - 2026-04-22：Windows 交互式 scheduled task 验证显示新 `type_text` 能写入 Notepad 且不会把前台从 Codex 切到 Notepad；Notepad 文本控件 UIA class 为 `RichEditD2DPT`，有 child native handle，可接收 `EM_REPLACESEL`。
 - 2026-04-23：Windows release artifact 接入 npm package bundled artifacts，不新增系统 installer/signing；root `open-computer-use` package 通过 launcher 按 `win32-arm64` / `win32-x64` 自动选择 `.exe`。
+- 2026-08-23：将需要真实桌面输入的 Windows 路径明确拆为 opt-in `SendInput`。pointer 不依赖不可预测的 background `SetForegroundWindow`，而是先用 `WindowFromPoint` 验证请求位置属于目标进程；keyboard 仍要求目标进程持有 foreground window。bridge 在注入前启用 per-monitor-v2 DPI awareness，统一 UIA、窗口和虚拟桌面物理坐标。
+- 2026-08-23：`app_post` 保持非全局语义。native WinForms button 用 `BM_CLICK` 触发控制自身的 click 合约，其他 native HWND 保留消息坐标路径；WPF/no-child-HWND 返回明确 capability error。
+- 2026-08-23：新增可观察的 WPF/WinForms fixtures，并用计数器和值验证 UIA、native message 和 interactive input 路径。
+- 2026-08-25：审查发现 `press_key` 在前台授权缺失时仍会走未保护的 `PostMessage` fallback；删除该路径并在未授权时 fail closed。后续审查还收紧了非 global drag fallback：验证 HWND 所有权和每次 `PostMessage` 投递结果。最终通过注册的 `go run . mcp` source launcher 完成 WPF 9-tool matrix、native `BM_CLICK`、global click 和 thumb-centered drag；新 unsigned PE 在首次启动时被主机移除，待签名 release artifact 替代此本地开发 launcher。

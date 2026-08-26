@@ -25,7 +25,7 @@ var clickMethodValues = []string{"auto", "accessibility", "app_post", "sky_click
 //go:embed runtime.ps1
 var windowsRuntimeScript string
 
-const serverInstructions = "Computer Use tools let you interact with Windows apps by performing UI actions.\n\nBegin by calling `get_app_state` every turn you want to use Computer Use to get the latest state before acting. The available tools are list_apps, get_app_state, save_screenshot, click, perform_secondary_action, scroll, drag, type_text, press_key, and set_value.\n\nTo inspect or understand visual pixels, call `get_app_state` with `include_image=true`; its image/png result is the model-visible screenshot. Do not use `press_key` to simulate PrintScreen, Win+Shift+S, or another operating-system screenshot shortcut. A successful action already returns a refreshed screenshot when available, so use that result rather than taking a second screenshot. Use `save_screenshot` only when the user asks to save or export a PNG file.\n\nPrefer element-targeted interactions over coordinate clicks when an index for the targeted element is available. Windows actions use UI Automation patterns first and fall back to window messages when an app does not expose the needed pattern. The Windows runtime does not auto-launch apps, perform SetFocus, or use UIA text fallback by default, so background-capable actions do not intentionally steal the user's foreground focus."
+const serverInstructions = "Computer Use tools let you interact with Windows apps by performing UI actions.\n\nBegin by calling `get_app_state` every turn you want to use Computer Use to get the latest state before acting. The available tools are list_apps, get_app_state, save_screenshot, click, perform_secondary_action, scroll, drag, type_text, press_key, and set_value.\n\nTo inspect or understand visual pixels, call `get_app_state` with `include_image=true`; its image/png result is the model-visible screenshot. Do not use `press_key` to simulate PrintScreen, Win+Shift+S, or another operating-system screenshot shortcut. A successful action already returns a refreshed screenshot when available, so use that result rather than taking a second screenshot. Use `save_screenshot` only when the user asks to save or export a PNG file.\n\nPrefer element-targeted interactions over coordinate clicks when an index for the targeted element is available. Windows actions use UI Automation patterns first and fall back to window messages when an app does not expose the needed pattern. The Windows runtime does not auto-launch apps, perform SetFocus, or use UIA text fallback by default, so background-capable actions do not intentionally steal the user's foreground focus. Global click and physical drag require both `OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT=1` and `OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1`; without those flags, drag only uses an app-scoped background window-message path that never moves the system pointer or changes foreground focus and may be unsupported by the target toolkit. `press_key` is rejected unless the foreground-input flag is set, and then requires a target that already owns the foreground window. The runtime only attempts a bounded `SetForegroundWindow` for keyboard input when `OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOCUS_ACTIONS=1` is also set; otherwise focus the target with an authorized global click first. These explicit Windows environment authorizations can move the pointer or foreground the target, and input can fail for foreground-policy or elevated/UIPI-protected applications."
 
 type toolDefinition struct {
 	Name        string         `json:"name"`
@@ -51,9 +51,11 @@ func textResult(text string, isError bool) toolCallResult {
 }
 
 type appDescriptor struct {
-	Name             string `json:"name"`
-	BundleIdentifier string `json:"bundleIdentifier,omitempty"`
-	PID              int    `json:"pid"`
+	Name                  string `json:"name"`
+	BundleIdentifier      string `json:"bundleIdentifier,omitempty"`
+	PID                   int    `json:"pid"`
+	ProcessStartTimeTicks int64  `json:"processStartTimeTicks,omitempty"`
+	MainWindowHandle      int64  `json:"mainWindowHandle,omitempty"`
 }
 
 type frame struct {
@@ -133,29 +135,32 @@ func (s *appSnapshot) result() toolCallResult {
 }
 
 type psRequest struct {
-	Tool         string         `json:"tool"`
-	App          string         `json:"app,omitempty"`
-	Element      *elementRecord `json:"element,omitempty"`
-	X            *float64       `json:"x,omitempty"`
-	Y            *float64       `json:"y,omitempty"`
-	FromX        *float64       `json:"from_x,omitempty"`
-	FromY        *float64       `json:"from_y,omitempty"`
-	ToX          *float64       `json:"to_x,omitempty"`
-	ToY          *float64       `json:"to_y,omitempty"`
-	ClickCount   int            `json:"click_count,omitempty"`
-	MouseButton  string         `json:"mouse_button,omitempty"`
-	ClickMethod  string         `json:"click_method,omitempty"`
-	Action       string         `json:"action,omitempty"`
-	Direction    string         `json:"direction,omitempty"`
-	Pages        float64        `json:"pages,omitempty"`
-	Text         string         `json:"text,omitempty"`
-	Key          string         `json:"key,omitempty"`
-	Value        string         `json:"value,omitempty"`
-	WindowBounds *frame         `json:"windowBounds,omitempty"`
-	TextLimit    any            `json:"text_limit,omitempty"`
-	MaxTreeNodes int            `json:"max_tree_nodes,omitempty"`
-	MaxTreeDepth int            `json:"max_tree_depth,omitempty"`
-	IncludeImage bool           `json:"include_image,omitempty"`
+	Tool                     string         `json:"tool"`
+	App                      string         `json:"app,omitempty"`
+	Element                  *elementRecord `json:"element,omitempty"`
+	X                        *float64       `json:"x,omitempty"`
+	Y                        *float64       `json:"y,omitempty"`
+	FromX                    *float64       `json:"from_x,omitempty"`
+	FromY                    *float64       `json:"from_y,omitempty"`
+	ToX                      *float64       `json:"to_x,omitempty"`
+	ToY                      *float64       `json:"to_y,omitempty"`
+	ClickCount               int            `json:"click_count,omitempty"`
+	MouseButton              string         `json:"mouse_button,omitempty"`
+	ClickMethod              string         `json:"click_method,omitempty"`
+	Action                   string         `json:"action,omitempty"`
+	Direction                string         `json:"direction,omitempty"`
+	Pages                    float64        `json:"pages,omitempty"`
+	Text                     string         `json:"text,omitempty"`
+	Key                      string         `json:"key,omitempty"`
+	Value                    string         `json:"value,omitempty"`
+	WindowBounds             *frame         `json:"windowBounds,omitempty"`
+	ExpectedPID              int            `json:"expectedPid,omitempty"`
+	ExpectedStartTimeTicks   int64          `json:"expectedProcessStartTimeTicks,omitempty"`
+	ExpectedMainWindowHandle int64          `json:"expectedMainWindowHandle,omitempty"`
+	TextLimit                any            `json:"text_limit,omitempty"`
+	MaxTreeNodes             int            `json:"max_tree_nodes,omitempty"`
+	MaxTreeDepth             int            `json:"max_tree_depth,omitempty"`
+	IncludeImage             bool           `json:"include_image,omitempty"`
 }
 
 type textLimit struct {
@@ -178,11 +183,15 @@ type psResponse struct {
 }
 
 type service struct {
-	snapshots map[string]*appSnapshot
+	snapshots          map[string]*appSnapshot
+	ambiguousSnapshots map[string]bool
 }
 
 func newService() *service {
-	return &service{snapshots: map[string]*appSnapshot{}}
+	return &service{
+		snapshots:          map[string]*appSnapshot{},
+		ambiguousSnapshots: map[string]bool{},
+	}
 }
 
 func (s *service) callTool(name string, args map[string]any) toolCallResult {
@@ -301,7 +310,15 @@ func (s *service) saveScreenshot(app, path string) toolCallResult {
 	if !filepath.IsAbs(path) {
 		return textResult("save_screenshot path must be absolute", true)
 	}
-	snapshot, result := s.refreshSnapshot(app, psRequest{Tool: "get_app_state", App: app, IncludeImage: true})
+	snapshot := s.currentSnapshot(app)
+	if snapshot == nil {
+		return s.snapshotActionError(app)
+	}
+	request, err := bindSnapshotTarget(snapshot, psRequest{Tool: "get_app_state", App: app, IncludeImage: true})
+	if err != nil {
+		return textResult(err.Error(), true)
+	}
+	snapshot, result := s.refreshSnapshot(app, request)
 	if result.IsError {
 		return result
 	}
@@ -328,15 +345,12 @@ func (s *service) click(app, elementIndex string, x, y *float64, clickCount int,
 	if clickMethod == "accessibility" && elementIndex == "" {
 		return textResult("click_method 'accessibility' requires element_index", true)
 	}
-	if clickMethod == "global" {
-		return textResult("click_method 'global' is not supported on Windows", true)
-	}
 	if clickMethod == "sky_click" {
 		return textResult("click_method 'sky_click' is not supported on Windows", true)
 	}
 	snapshot := s.currentSnapshot(app)
 	if snapshot == nil {
-		return textResult("No app state is available for "+app+". Run get_app_state before action tools.", true)
+		return s.snapshotActionError(app)
 	}
 	request := psRequest{
 		Tool:         "click",
@@ -355,7 +369,7 @@ func (s *service) click(app, elementIndex string, x, y *float64, clickCount int,
 		}
 		request.Element = record
 	}
-	return s.actionResult(app, request)
+	return s.actionResult(app, snapshot, request)
 }
 
 func (s *service) performSecondaryAction(app, elementIndex, action string) toolCallResult {
@@ -370,13 +384,13 @@ func (s *service) performSecondaryAction(app, elementIndex, action string) toolC
 	}
 	snapshot := s.currentSnapshot(app)
 	if snapshot == nil {
-		return textResult("No app state is available for "+app+". Run get_app_state before action tools.", true)
+		return s.snapshotActionError(app)
 	}
 	record, err := lookupElement(snapshot, elementIndex)
 	if err != nil {
 		return textResult(err.Error(), true)
 	}
-	return s.actionResult(app, psRequest{Tool: "perform_secondary_action", App: app, Element: record, Action: action})
+	return s.actionResult(app, snapshot, psRequest{Tool: "perform_secondary_action", App: app, Element: record, Action: action})
 }
 
 func (s *service) scroll(app, direction, elementIndex string, pages float64) toolCallResult {
@@ -395,13 +409,13 @@ func (s *service) scroll(app, direction, elementIndex string, pages float64) too
 	}
 	snapshot := s.currentSnapshot(app)
 	if snapshot == nil {
-		return textResult("No app state is available for "+app+". Run get_app_state before action tools.", true)
+		return s.snapshotActionError(app)
 	}
 	record, err := lookupElement(snapshot, elementIndex)
 	if err != nil {
 		return textResult(err.Error(), true)
 	}
-	return s.actionResult(app, psRequest{Tool: "scroll", App: app, Element: record, Direction: normalized, Pages: pages})
+	return s.actionResult(app, snapshot, psRequest{Tool: "scroll", App: app, Element: record, Direction: normalized, Pages: pages, WindowBounds: snapshot.WindowBounds})
 }
 
 func (s *service) drag(app string, fromX, fromY, toX, toY *float64) toolCallResult {
@@ -422,9 +436,9 @@ func (s *service) drag(app string, fromX, fromY, toX, toY *float64) toolCallResu
 	}
 	snapshot := s.currentSnapshot(app)
 	if snapshot == nil {
-		return textResult("No app state is available for "+app+". Run get_app_state before action tools.", true)
+		return s.snapshotActionError(app)
 	}
-	return s.actionResult(app, psRequest{Tool: "drag", App: app, FromX: fromX, FromY: fromY, ToX: toX, ToY: toY, WindowBounds: snapshot.WindowBounds})
+	return s.actionResult(app, snapshot, psRequest{Tool: "drag", App: app, FromX: fromX, FromY: fromY, ToX: toX, ToY: toY, WindowBounds: snapshot.WindowBounds})
 }
 
 func (s *service) typeText(app, text string) toolCallResult {
@@ -434,10 +448,11 @@ func (s *service) typeText(app, text string) toolCallResult {
 	if text == "" {
 		return textResult("Missing required argument: text", true)
 	}
-	if s.currentSnapshot(app) == nil {
-		return textResult("No app state is available for "+app+". Run get_app_state before action tools.", true)
+	snapshot := s.currentSnapshot(app)
+	if snapshot == nil {
+		return s.snapshotActionError(app)
 	}
-	return s.actionResult(app, psRequest{Tool: "type_text", App: app, Text: text})
+	return s.actionResult(app, snapshot, psRequest{Tool: "type_text", App: app, Text: text})
 }
 
 func (s *service) pressKey(app, key string) toolCallResult {
@@ -447,10 +462,11 @@ func (s *service) pressKey(app, key string) toolCallResult {
 	if key == "" {
 		return textResult("Missing required argument: key", true)
 	}
-	if s.currentSnapshot(app) == nil {
-		return textResult("No app state is available for "+app+". Run get_app_state before action tools.", true)
+	snapshot := s.currentSnapshot(app)
+	if snapshot == nil {
+		return s.snapshotActionError(app)
 	}
-	return s.actionResult(app, psRequest{Tool: "press_key", App: app, Key: key})
+	return s.actionResult(app, snapshot, psRequest{Tool: "press_key", App: app, Key: key})
 }
 
 func (s *service) setValue(app, elementIndex, value string) toolCallResult {
@@ -462,26 +478,40 @@ func (s *service) setValue(app, elementIndex, value string) toolCallResult {
 	}
 	snapshot := s.currentSnapshot(app)
 	if snapshot == nil {
-		return textResult("No app state is available for "+app+". Run get_app_state before action tools.", true)
+		return s.snapshotActionError(app)
 	}
 	record, err := lookupElement(snapshot, elementIndex)
 	if err != nil {
 		return textResult(err.Error(), true)
 	}
-	return s.actionResult(app, psRequest{Tool: "set_value", App: app, Element: record, Value: value})
+	return s.actionResult(app, snapshot, psRequest{Tool: "set_value", App: app, Element: record, Value: value})
 }
 
-func (s *service) actionResult(app string, request psRequest) toolCallResult {
+func bindSnapshotTarget(snapshot *appSnapshot, request psRequest) (psRequest, error) {
+	if snapshot == nil || snapshot.App.PID <= 0 || snapshot.App.ProcessStartTimeTicks <= 0 || snapshot.App.MainWindowHandle == 0 {
+		return psRequest{}, errors.New("No stable target identity is available. Run get_app_state again.")
+	}
+	request.ExpectedPID = snapshot.App.PID
+	request.ExpectedStartTimeTicks = snapshot.App.ProcessStartTimeTicks
+	request.ExpectedMainWindowHandle = snapshot.App.MainWindowHandle
+	if request.WindowBounds == nil {
+		request.WindowBounds = snapshot.WindowBounds
+	}
+	return request, nil
+}
+
+func (s *service) actionResult(app string, snapshot *appSnapshot, request psRequest) toolCallResult {
+	request, err := bindSnapshotTarget(snapshot, request)
+	if err != nil {
+		return textResult(err.Error(), true)
+	}
+	request.App = app
 	request.IncludeImage = true
-	snapshot, result := s.refreshSnapshot(app, request)
+	refreshed, result := s.refreshSnapshot(app, request)
 	if result.IsError {
 		return result
 	}
-	return snapshot.result()
-}
-
-func (s *service) currentSnapshot(app string) *appSnapshot {
-	return s.snapshots[strings.ToLower(app)]
+	return refreshed.result()
 }
 
 func (s *service) refreshSnapshot(app string, request psRequest) (*appSnapshot, toolCallResult) {
@@ -499,14 +529,48 @@ func (s *service) refreshSnapshot(app string, request psRequest) (*appSnapshot, 
 	return response.Snapshot, toolCallResult{}
 }
 
+func snapshotCacheKey(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func sameSnapshotTarget(left, right *appSnapshot) bool {
+	if left == nil || right == nil {
+		return false
+	}
+	return left.App.PID == right.App.PID &&
+		left.App.ProcessStartTimeTicks == right.App.ProcessStartTimeTicks &&
+		left.App.MainWindowHandle == right.App.MainWindowHandle
+}
+
 func (s *service) rememberSnapshot(query string, snapshot *appSnapshot) {
 	keys := []string{query, snapshot.App.Name, snapshot.App.BundleIdentifier, strconv.Itoa(snapshot.App.PID)}
-	for _, key := range keys {
-		key = strings.ToLower(strings.TrimSpace(key))
-		if key != "" {
-			s.snapshots[key] = snapshot
+	for _, rawKey := range keys {
+		key := snapshotCacheKey(rawKey)
+		if key == "" || s.ambiguousSnapshots[key] {
+			continue
 		}
+		if existing := s.snapshots[key]; existing != nil && !sameSnapshotTarget(existing, snapshot) {
+			delete(s.snapshots, key)
+			s.ambiguousSnapshots[key] = true
+			continue
+		}
+		s.snapshots[key] = snapshot
 	}
+}
+
+func (s *service) currentSnapshot(app string) *appSnapshot {
+	key := snapshotCacheKey(app)
+	if key == "" || s.ambiguousSnapshots[key] {
+		return nil
+	}
+	return s.snapshots[key]
+}
+
+func (s *service) snapshotActionError(app string) toolCallResult {
+	if s.ambiguousSnapshots[snapshotCacheKey(app)] {
+		return textResult("App selector "+app+" matches multiple cached targets. Run get_app_state with an exact window title or PID before action tools.", true)
+	}
+	return textResult("No app state is available for "+app+". Run get_app_state before action tools.", true)
 }
 
 func lookupElement(snapshot *appSnapshot, elementIndex string) (*elementRecord, error) {
@@ -769,7 +833,7 @@ func toolDefinitions() []toolDefinition {
 				"y":             numberProperty("Y coordinate in screenshot pixel coordinates"),
 				"click_count":   integerProperty("Number of clicks. Defaults to 1"),
 				"mouse_button":  enumStringProperty("Mouse button to click. Defaults to left.", []string{"left", "right", "middle"}),
-				"click_method":  enumStringProperty("Click implementation: auto (default), accessibility, app_post, sky_click, or global. Accessibility requires element_index. Windows supports app_post through HWND messages and does not currently support sky_click or global.", clickMethodValues),
+				"click_method":  enumStringProperty("Click implementation: auto (default), accessibility, app_post, sky_click, or global. Accessibility requires element_index. Windows supports app_post through HWND messages; global requires explicit foreground and global-pointer environment authorization. Windows does not support sky_click.", clickMethodValues),
 			}, []string{"app"}),
 		},
 		{
@@ -823,7 +887,7 @@ func toolDefinitions() []toolDefinition {
 		},
 		{
 			Name:        "press_key",
-			Description: "Press a key or key-combination on the keyboard, including modifier and navigation keys.\n  - This supports xdotool's `key` syntax.\n  - Examples: \"a\", \"Return\", \"Tab\", \"super+c\", \"Up\", \"KP_0\" (for the numpad 0). This tool is part of plugin `Computer Use`.",
+			Description: "Press a key or key-combination on the keyboard, including modifier and navigation keys. Windows interactive input requires explicit foreground-input authorization and a foreground target; enabling the separate focus-actions flag permits a bounded foreground attempt.\n  - This supports xdotool's `key` syntax.\n  - Examples: \"a\", \"Return\", \"Tab\", \"super+c\", \"Up\", \"KP_0\" (for the numpad 0). This tool is part of plugin `Computer Use`.",
 			Annotations: defaultAnnotations(),
 			InputSchema: objectSchema(map[string]any{
 				"app": stringProperty("App name or bundle identifier"),

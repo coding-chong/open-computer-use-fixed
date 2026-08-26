@@ -27,8 +27,14 @@
   - `Open Computer Use.app` 的系统权限
   - 本地使用场景
   共同提供。
-- `click_method=global` 是显式的系统级指针路径，可能移动真实鼠标、改变前台焦点或命中坐标处的其他窗口。调用参数本身不视为足够授权；macOS 和支持该模式的 Linux runtime 还要求进程环境中设置 `OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1`。未设置时必须在任何可见 cursor 移动或真实输入事件之前拒绝请求。
-- `click_method=app_post`、`sky_click` 与 `accessibility` 不允许静默切换到 `global`。这保证调用方选择的非侵入边界在失败时仍然成立。
+- `click_method=global` 和 physical `drag` 是显式的系统级指针路径，可能移动真实鼠标、改变前台焦点或命中坐标处的其他窗口。调用参数本身不视为足够授权；macOS 和支持该模式的 Linux runtime 要求进程环境中设置 `OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1`。Windows 还要求 `OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT=1`，并在任何输入注入前验证目标进程拥有请求坐标处、且属于 snapshot-bound top-level HWND ancestry 的窗口；physical drag 还验证整条路径。未设置授权或窗口归属不匹配时，必须在任何可见 cursor 移动或真实输入事件之前拒绝请求。
+- Windows 未授权 `drag` 只可使用已验证目标 HWND 的 app-scoped `PostMessage` best-effort fallback；它检查每次投递结果，不移动系统 pointer 或改变 foreground，且不得被表述为 global input。
+- 每个 action 都携带 preceding snapshot 的 PID、process creation time 和 top-level HWND。PowerShell runtime 在任何 UIA pattern、window message、foreground 或 `SendInput` 之前验证三者；不匹配统一返回 `Target changed; call get_app_state again.`。Go snapshot cache 对共享的 executable/process-name alias 发现多个 immutable targets 时标记为 ambiguous 并拒绝 action；精确 window title 或 PID 仍可选择单一实例。
+- 坐标 action 还携带 snapshot 的物理 window bounds；当前位置或尺寸任一分量变化超过 1 physical pixel 时 fail closed，必须重新 snapshot。semantic UIA action 只要求 identity，不因窗口移动而被错误拒绝。
+- `app_post` 的 native target 必须是 snapshotted top-level HWND 本身或其 descendant，且请求点必须仍在目标窗口和 child HWND 内；同 PID 的另一 top-level window、窗口外坐标或失效的 ScreenToClient 都拒绝，不会借道发送到其他窗口。
+- Windows `press_key` 同样要求 `OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT=1`，并要求目标进程已经持有 foreground window；如果另外设置既有的 `OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOCUS_ACTIONS=1`，运行时才会做有界的 `SetForegroundWindow` 尝试，否则必须先通过授权的 global click 聚焦目标。运行时不使用 `AttachThreadInput`、权限提升或 UAC 绕过来改变该限制。已提升进程或主动拦截 synthetic input 的应用可能仍然拒绝输入。
+- Windows 的 UIA `ValuePattern` 文本 fallback 可能带来前台焦点风险，因此需要单独设置 `OPEN_COMPUTER_USE_WINDOWS_ALLOW_UIA_TEXT_FALLBACK=1`。child edit HWND 路径不依赖该标志。
+- `click_method=app_post`、`sky_click` 与 `accessibility` 不允许静默切换到 `global`。Windows `app_post` 只向同进程、同 snapshot-window ancestry 的 native HWND 投递消息；WPF/no-child-HWND 目标必须返回 capability error。这保证调用方选择的非侵入边界在失败时仍然成立。
 - `click_method=sky_click` 是显式 macOS 私有 SPI 能力，不进入 `auto`。它不移动系统指针、不改变 WindowServer frontmost app，也不 raise 或切换目标窗口；内部只让目标应用短暂进入 synthetic-active 状态，绝不向真实前台应用发送 defocus record，renderer settle 后也只撤销目标的合成状态。点击后的 action-result snapshot 禁止 activate / `AXRaise` 恢复。它仍会向指定 PID/window 注入真实输入语义，因此只允许使用当前 snapshot 的 on-screen、同 PID 窗口，并在窗口身份不匹配、target-focus record 失败或私有符号缺失时 fail closed。第一版仅支持同一 Space 内的左键单击/双击。
 - SkyLight ABI、raw event field 和 Chromium 接收行为都不受 Apple 公共兼容性承诺保护。系统升级后的失败不得触发静默 global fallback；应先重新验证符号和受控目标，再决定是否更新实现。
 - 下一阶段应优先补：

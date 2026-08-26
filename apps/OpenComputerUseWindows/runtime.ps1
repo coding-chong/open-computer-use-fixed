@@ -35,13 +35,102 @@ public static class OCUWin32 {
         public int Y;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MOUSEINPUT {
+        public int dx;
+        public int dy;
+        public uint mouseData;
+        public uint dwFlags;
+        public uint time;
+        public UIntPtr dwExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct KEYBDINPUT {
+        public ushort wVk;
+        public ushort wScan;
+        public uint dwFlags;
+        public uint time;
+        public UIntPtr dwExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Explicit)]
+    public struct INPUTUNION {
+        [FieldOffset(0)] public MOUSEINPUT mi;
+        [FieldOffset(0)] public KEYBDINPUT ki;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct INPUT {
+        public uint type;
+        public INPUTUNION U;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+
+    public static INPUT NewMouseInput(int x, int y, uint flags) {
+        return new INPUT {
+            type = 0,
+            U = new INPUTUNION {
+                mi = new MOUSEINPUT { dx = x, dy = y, dwFlags = flags }
+            }
+        };
+    }
+
+    public static INPUT NewKeyboardInput(ushort virtualKey, uint flags) {
+        return new INPUT {
+            type = 1,
+            U = new INPUTUNION {
+                ki = new KEYBDINPUT { wVk = virtualKey, dwFlags = flags }
+            }
+        };
+    }
+
+    public static uint SendInputRecords(INPUT[] inputs) {
+        if (inputs == null) {
+            return 0;
+        }
+        if (inputs.Length == 0) {
+            return 0;
+        }
+        return SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT)));
+    }
+
     [DllImport("user32.dll")]
     public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
 
     [DllImport("user32.dll")]
     public static extern bool ScreenToClient(IntPtr hWnd, ref POINT point);
 
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    public static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+    [DllImport("user32.dll")]
+    public static extern int GetSystemMetrics(int index);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr dpiContext);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr ChildWindowFromPointEx(IntPtr hWndParent, POINT point, uint flags);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr WindowFromPoint(POINT point);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsChild(IntPtr hWndParent, IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetAncestor(IntPtr hWnd, uint gaFlags);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern bool PostMessage(IntPtr hWnd, UInt32 msg, IntPtr wParam, IntPtr lParam);
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
@@ -58,6 +147,12 @@ public static class OCUWin32 {
 }
 "@
 
+try {
+    # UIA, window bounds, and SendInput must share physical desktop coordinates.
+    [void][OCUWin32]::SetThreadDpiAwarenessContext([IntPtr](-4))
+} catch {
+}
+
 $WM_SETTEXT = 0x000C
 $WM_MOUSEMOVE = 0x0200
 $WM_LBUTTONDOWN = 0x0201
@@ -73,6 +168,26 @@ $WM_KEYUP = 0x0101
 $WM_CHAR = 0x0102
 $EM_SETSEL = 0x00B1
 $EM_REPLACESEL = 0x00C2
+$BM_CLICK = 0x00F5
+$MOUSEEVENTF_MOVE = 0x0001
+$MOUSEEVENTF_LEFTDOWN = 0x0002
+$MOUSEEVENTF_LEFTUP = 0x0004
+$MOUSEEVENTF_RIGHTDOWN = 0x0008
+$MOUSEEVENTF_RIGHTUP = 0x0010
+$MOUSEEVENTF_MIDDLEDOWN = 0x0020
+$MOUSEEVENTF_MIDDLEUP = 0x0040
+$MOUSEEVENTF_MOVE_NOCOALESCE = 0x2000
+$MOUSEEVENTF_VIRTUALDESK = 0x4000
+$MOUSEEVENTF_ABSOLUTE = 0x8000
+$KEYEVENTF_EXTENDEDKEY = 0x0001
+$KEYEVENTF_KEYUP = 0x0002
+$SM_XVIRTUALSCREEN = 76
+$SM_YVIRTUALSCREEN = 77
+$SM_CXVIRTUALSCREEN = 78
+$SM_CYVIRTUALSCREEN = 79
+$CWP_SKIPINVISIBLE = 0x0001
+$CWP_SKIPDISABLED = 0x0002
+$CWP_SKIPTRANSPARENT = 0x0004
 
 function Test-EnvFlagEnabled([string]$name) {
     $value = [Environment]::GetEnvironmentVariable($name)
@@ -81,6 +196,135 @@ function Test-EnvFlagEnabled([string]$name) {
     }
     $normalized = $value.Trim().ToLowerInvariant()
     return @("1", "true", "yes", "on") -contains $normalized
+}
+
+function Get-HwndProcessId([IntPtr]$hwnd) {
+    if ($hwnd -eq [IntPtr]::Zero -or -not [OCUWin32]::IsWindow($hwnd)) {
+        return 0
+    }
+    [uint32]$processId = 0
+    [void][OCUWin32]::GetWindowThreadProcessId($hwnd, [ref]$processId)
+    return [int]$processId
+}
+
+function Test-HwndOwnedByProcess([IntPtr]$hwnd, $process) {
+    return ((Get-HwndProcessId $hwnd) -eq [int]$process.Id)
+}
+
+function Throw-TargetChanged {
+    throw "Target changed; call get_app_state again."
+}
+
+function Get-ProcessStartTimeTicks($process) {
+    try {
+        return [int64]$process.StartTime.ToUniversalTime().Ticks
+    } catch {
+        Throw-TargetChanged
+    }
+}
+
+function Resolve-SnapshotActionTarget($operation) {
+    [int]$expectedPid = $operation.expectedPid
+    [int64]$expectedStartTimeTicks = $operation.expectedProcessStartTimeTicks
+    [int64]$expectedMainWindowHandle = $operation.expectedMainWindowHandle
+    if ($expectedPid -le 0 -or $expectedStartTimeTicks -le 0 -or $expectedMainWindowHandle -eq 0) {
+        Throw-TargetChanged
+    }
+
+    try {
+        $process = Get-Process -Id $expectedPid -ErrorAction Stop
+    } catch {
+        Throw-TargetChanged
+    }
+    if ((Get-ProcessStartTimeTicks $process) -ne $expectedStartTimeTicks) {
+        Throw-TargetChanged
+    }
+
+    try {
+        $element = Get-MainElement $process
+        $hwnd = Get-ProcessTargetHandle $process $element
+    } catch {
+        Throw-TargetChanged
+    }
+    if ($hwnd -eq [IntPtr]::Zero -or $hwnd.ToInt64() -ne $expectedMainWindowHandle) {
+        Throw-TargetChanged
+    }
+    return [pscustomobject]@{
+        process = $process
+        hwnd = $hwnd
+    }
+}
+
+function Test-ProcessOwnsForegroundWindow($process, [IntPtr]$expectedHwnd) {
+    $foregroundHwnd = [OCUWin32]::GetForegroundWindow()
+    return (Test-HwndOwnedByProcess $foregroundHwnd $process) -and (Test-HwndDescendantOf $expectedHwnd $foregroundHwnd)
+}
+
+function Assert-InteractiveInputAllowed([bool]$requiresPointer) {
+    if (-not (Test-EnvFlagEnabled "OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT")) {
+        throw "Interactive Windows input is disabled by default; set OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT=1 to enable it."
+    }
+    if ($requiresPointer -and -not (Test-EnvFlagEnabled "OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS")) {
+        throw "Global pointer input is disabled by default; set OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1 to enable it."
+    }
+}
+
+function Test-InteractivePointerInputEnabled() {
+    return (
+        (Test-EnvFlagEnabled "OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT") -and
+        (Test-EnvFlagEnabled "OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS")
+    )
+}
+
+function Ensure-InteractivePointerTarget($process, [IntPtr]$hwnd, [int]$screenX, [int]$screenY) {
+    Assert-InteractiveInputAllowed $true
+    if (-not (Test-HwndOwnedByProcess $hwnd $process)) {
+        throw "The requested app no longer owns a valid top-level window."
+    }
+
+    $point = New-Object OCUWin32+POINT
+    $point.X = $screenX
+    $point.Y = $screenY
+    $hitWindow = [OCUWin32]::WindowFromPoint($point)
+    if (-not (Test-HwndDescendantOf $hwnd $hitWindow)) {
+        throw "The requested app is not the topmost descendant of the snapshot window at the requested pointer coordinates; interactive input was not sent."
+    }
+}
+
+function Assert-InteractiveDragPath($process, [IntPtr]$hwnd, [int]$fromX, [int]$fromY, [int]$toX, [int]$toY, [int]$steps) {
+    if ($steps -lt 1) {
+        throw "Interactive drag requires at least one movement step."
+    }
+    for ($i = 0; $i -le $steps; $i++) {
+        $x = [int][math]::Round($fromX + (($toX - $fromX) * $i / $steps))
+        $y = [int][math]::Round($fromY + (($toY - $fromY) * $i / $steps))
+        Ensure-InteractivePointerTarget $process $hwnd $x $y
+    }
+}
+
+function Ensure-InteractiveKeyboardTarget($process, [IntPtr]$hwnd) {
+    Assert-InteractiveInputAllowed $false
+    if (-not (Test-HwndOwnedByProcess $hwnd $process)) {
+        throw "The requested app no longer owns a valid top-level window."
+    }
+    if (Test-ProcessOwnsForegroundWindow $process $hwnd) {
+        return
+    }
+    if (-not (Test-EnvFlagEnabled "OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOCUS_ACTIONS")) {
+        throw "The requested app is not foreground; focus it with an authorized global click or set OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOCUS_ACTIONS=1 to permit a bounded foreground attempt."
+    }
+
+    if (-not [OCUWin32]::SetForegroundWindow($hwnd)) {
+        throw "Windows rejected the bounded foreground request for interactive keyboard input; first focus the target with an authorized global click or use a non-elevated target."
+    }
+    for ($i = 0; $i -lt 12; $i++) {
+        Start-Sleep -Milliseconds 50
+        if (Test-ProcessOwnsForegroundWindow $process $hwnd) {
+            return
+        }
+    }
+
+    throw "Windows could not foreground the requested app for interactive keyboard input; first focus it with an authorized global click or use a non-elevated target."
 }
 
 function New-Frame($x, $y, $width, $height) {
@@ -113,6 +357,88 @@ function Get-WindowRectFrame([IntPtr]$hwnd) {
     return $null
 }
 
+function Test-HwndDescendantOf([IntPtr]$rootHwnd, [IntPtr]$candidateHwnd) {
+    if ($rootHwnd -eq [IntPtr]::Zero -or $candidateHwnd -eq [IntPtr]::Zero) {
+        return $false
+    }
+    if (-not [OCUWin32]::IsWindow($rootHwnd) -or -not [OCUWin32]::IsWindow($candidateHwnd)) {
+        return $false
+    }
+    if ($rootHwnd -eq $candidateHwnd) {
+        return $true
+    }
+    return [OCUWin32]::IsChild($rootHwnd, $candidateHwnd)
+}
+
+function Test-ScreenPointInHwnd([IntPtr]$hwnd, [int]$screenX, [int]$screenY) {
+    $bounds = Get-WindowRectFrame $hwnd
+    if ($null -eq $bounds) {
+        return $false
+    }
+    return (
+        $screenX -ge [int][math]::Floor($bounds.x) -and
+        $screenX -lt [int][math]::Ceiling($bounds.x + $bounds.width) -and
+        $screenY -ge [int][math]::Floor($bounds.y) -and
+        $screenY -lt [int][math]::Ceiling($bounds.y + $bounds.height)
+    )
+}
+
+function Assert-ScreenPointInHwnd([IntPtr]$hwnd, [int]$screenX, [int]$screenY) {
+    if (-not (Test-ScreenPointInHwnd $hwnd $screenX $screenY)) {
+        Throw-TargetChanged
+    }
+}
+
+function Assert-AppPostDescendant([IntPtr]$rootHwnd, [IntPtr]$targetHwnd, [int]$screenX, [int]$screenY) {
+    if (-not (Test-HwndDescendantOf $rootHwnd $targetHwnd)) {
+        Throw-TargetChanged
+    }
+    Assert-ScreenPointInHwnd $rootHwnd $screenX $screenY
+    if (-not (Test-ScreenPointInHwnd $targetHwnd $screenX $screenY)) {
+        Throw-TargetChanged
+    }
+}
+
+function Assert-SnapshotCoordinateBounds([IntPtr]$hwnd, $expectedBounds) {
+    if ($null -eq $expectedBounds -or $null -eq $expectedBounds.x -or $null -eq $expectedBounds.y -or $null -eq $expectedBounds.width -or $null -eq $expectedBounds.height) {
+        Throw-TargetChanged
+    }
+    $currentBounds = Get-WindowRectFrame $hwnd
+    if ($null -eq $currentBounds) {
+        Throw-TargetChanged
+    }
+
+    $components = @(
+        [pscustomobject]@{ expected = [double]$expectedBounds.x; actual = [double]$currentBounds.x },
+        [pscustomobject]@{ expected = [double]$expectedBounds.y; actual = [double]$currentBounds.y },
+        [pscustomobject]@{ expected = [double]$expectedBounds.width; actual = [double]$currentBounds.width },
+        [pscustomobject]@{ expected = [double]$expectedBounds.height; actual = [double]$currentBounds.height }
+    )
+    foreach ($component in $components) {
+        if ([math]::Abs($component.expected - $component.actual) -gt 1) {
+            Throw-TargetChanged
+        }
+    }
+}
+
+function Assert-AppScopedMessageTarget($process, [IntPtr]$hwnd) {
+    if (-not (Test-HwndOwnedByProcess $hwnd $process)) {
+        Throw-TargetChanged
+    }
+}
+
+function Convert-ScreenPointToAppClient($process, [IntPtr]$hwnd, [int]$screenX, [int]$screenY) {
+    Assert-AppScopedMessageTarget $process $hwnd
+    Assert-ScreenPointInHwnd $hwnd $screenX $screenY
+    $point = New-Object OCUWin32+POINT
+    $point.X = $screenX
+    $point.Y = $screenY
+    if (-not [OCUWin32]::ScreenToClient($hwnd, [ref]$point)) {
+        throw "Windows could not convert the requested app-scoped coordinates."
+    }
+    return $point
+}
+
 function Get-ElementFrame($element, $windowBounds) {
     try {
         $rect = $element.Current.BoundingRectangle
@@ -138,11 +464,111 @@ function Get-ScreenPoint($localFrame, $windowBounds) {
     }
 }
 
-function Send-MouseClick([IntPtr]$hwnd, [int]$screenX, [int]$screenY, [string]$button, [int]$count) {
-    $point = New-Object OCUWin32+POINT
-    $point.X = $screenX
-    $point.Y = $screenY
-    [void][OCUWin32]::ScreenToClient($hwnd, [ref]$point)
+function ConvertTo-AbsolutePointerPoint([int]$screenX, [int]$screenY) {
+    $left = [OCUWin32]::GetSystemMetrics($SM_XVIRTUALSCREEN)
+    $top = [OCUWin32]::GetSystemMetrics($SM_YVIRTUALSCREEN)
+    $width = [OCUWin32]::GetSystemMetrics($SM_CXVIRTUALSCREEN)
+    $height = [OCUWin32]::GetSystemMetrics($SM_CYVIRTUALSCREEN)
+    if ($width -le 1 -or $height -le 1) {
+        throw "Windows did not report a usable virtual desktop for global pointer input."
+    }
+    if ($screenX -lt $left -or $screenX -ge ($left + $width) -or $screenY -lt $top -or $screenY -ge ($top + $height)) {
+        throw "Global pointer coordinates are outside the virtual desktop."
+    }
+    return [pscustomobject]@{
+        x = [int][math]::Round((($screenX - $left) * 65535.0) / ($width - 1))
+        y = [int][math]::Round((($screenY - $top) * 65535.0) / ($height - 1))
+    }
+}
+
+function Submit-InteractiveInputRecords($records, [string]$operation) {
+    [OCUWin32+INPUT[]]$typedRecords = @($records)
+    $recordCount = $typedRecords.Length
+    if ($recordCount -eq 0) {
+        throw "No Windows input records were generated for ${operation}."
+    }
+    $accepted = [OCUWin32]::SendInputRecords($typedRecords)
+    if ([int]$accepted -eq $recordCount) {
+        return
+    }
+    if ([int]$accepted -eq 0) {
+        throw "Windows accepted 0 of $recordCount interactive input records for $operation; SendInput does not provide a reliable error code for rejected records, and the batch may be blocked by foreground policy or UIPI. No retry was attempted because SendInput submission is not safely replayable."
+    }
+    throw "Windows accepted $accepted of $recordCount interactive input records for $operation; SendInput does not provide a reliable error code for rejected records, and the target may be blocked by foreground policy or UIPI. No retry was attempted because SendInput submission is not safely replayable."
+}
+
+function Get-GlobalMouseButtonFlags([string]$button) {
+    if ($button -eq "left") {
+        return [pscustomobject]@{ down = $MOUSEEVENTF_LEFTDOWN; up = $MOUSEEVENTF_LEFTUP }
+    }
+    if ($button -eq "right") {
+        return [pscustomobject]@{ down = $MOUSEEVENTF_RIGHTDOWN; up = $MOUSEEVENTF_RIGHTUP }
+    }
+    if ($button -eq "middle") {
+        return [pscustomobject]@{ down = $MOUSEEVENTF_MIDDLEDOWN; up = $MOUSEEVENTF_MIDDLEUP }
+    }
+    throw "Unsupported mouse button: $button"
+}
+
+function New-GlobalMouseInput([int]$screenX, [int]$screenY, [uint32]$eventFlags) {
+    $point = ConvertTo-AbsolutePointerPoint $screenX $screenY
+    $flags = [uint32]($MOUSEEVENTF_MOVE -bor $MOUSEEVENTF_MOVE_NOCOALESCE -bor $MOUSEEVENTF_VIRTUALDESK -bor $MOUSEEVENTF_ABSOLUTE -bor $eventFlags)
+    return [OCUWin32]::NewMouseInput($point.x, $point.y, $flags)
+}
+
+function Send-InteractiveMouseClick($process, [IntPtr]$hwnd, [int]$screenX, [int]$screenY, [string]$button, [int]$count) {
+    Ensure-InteractivePointerTarget $process $hwnd $screenX $screenY
+    $buttonFlags = Get-GlobalMouseButtonFlags $button
+    $records = @()
+    $repeat = [math]::Max(1, $count)
+    for ($i = 0; $i -lt $repeat; $i++) {
+        $records += New-GlobalMouseInput $screenX $screenY 0
+        $records += New-GlobalMouseInput $screenX $screenY $buttonFlags.down
+        $records += New-GlobalMouseInput $screenX $screenY $buttonFlags.up
+    }
+    Submit-InteractiveInputRecords $records "mouse click"
+}
+
+function Send-InteractiveDrag($process, [IntPtr]$hwnd, [int]$fromX, [int]$fromY, [int]$toX, [int]$toY) {
+    $steps = 12
+    Assert-InteractiveDragPath $process $hwnd $fromX $fromY $toX $toY $steps
+    $records = @()
+    $records += New-GlobalMouseInput $fromX $fromY 0
+    $records += New-GlobalMouseInput $fromX $fromY $MOUSEEVENTF_LEFTDOWN
+    for ($i = 1; $i -le $steps; $i++) {
+        $x = [int][math]::Round($fromX + (($toX - $fromX) * $i / $steps))
+        $y = [int][math]::Round($fromY + (($toY - $fromY) * $i / $steps))
+        $records += New-GlobalMouseInput $x $y 0
+    }
+    $records += New-GlobalMouseInput $toX $toY $MOUSEEVENTF_LEFTUP
+    Submit-InteractiveInputRecords $records "drag"
+}
+
+function Test-NativeButtonElement($element) {
+    if ($null -eq $element) {
+        return $false
+    }
+    $controlType = Get-ElementControlTypeName $element
+    $className = Get-ElementString $element "ClassName"
+    return (
+        ($controlType -like "*Button*" -and $className -like "WindowsForms*.BUTTON*") -or
+        ($className -like "WindowsForms*.BUTTON*")
+    )
+}
+
+function Send-NativeButtonClick($process, [IntPtr]$hwnd, [int]$count) {
+    Assert-AppScopedMessageTarget $process $hwnd
+    $repeat = [math]::Max(1, $count)
+    for ($i = 0; $i -lt $repeat; $i++) {
+        if (-not [OCUWin32]::PostMessage($hwnd, $BM_CLICK, [IntPtr]::Zero, [IntPtr]::Zero)) {
+            throw "Windows could not queue the requested native button click message."
+        }
+        Start-Sleep -Milliseconds 50
+    }
+}
+
+function Send-MouseClick($process, [IntPtr]$hwnd, [int]$screenX, [int]$screenY, [string]$button, [int]$count) {
+    $point = Convert-ScreenPointToAppClient $process $hwnd $screenX $screenY
     $lParam = ConvertTo-LParam $point.X $point.Y
 
     $down = $WM_LBUTTONDOWN
@@ -160,42 +586,54 @@ function Send-MouseClick([IntPtr]$hwnd, [int]$screenX, [int]$screenY, [string]$b
 
     $repeat = [math]::Max(1, $count)
     for ($i = 0; $i -lt $repeat; $i++) {
-        [void][OCUWin32]::PostMessage($hwnd, $WM_MOUSEMOVE, [IntPtr]::Zero, $lParam)
-        [void][OCUWin32]::PostMessage($hwnd, $down, [IntPtr]$downFlag, $lParam)
+        Assert-AppScopedMessageTarget $process $hwnd
+        if (-not [OCUWin32]::PostMessage($hwnd, $WM_MOUSEMOVE, [IntPtr]::Zero, $lParam)) {
+            throw "Windows could not queue the requested mouse move message."
+        }
+        if (-not [OCUWin32]::PostMessage($hwnd, $down, [IntPtr]$downFlag, $lParam)) {
+            throw "Windows could not queue the requested mouse-down message."
+        }
         Start-Sleep -Milliseconds 35
-        [void][OCUWin32]::PostMessage($hwnd, $up, [IntPtr]::Zero, $lParam)
+        if (-not [OCUWin32]::PostMessage($hwnd, $up, [IntPtr]::Zero, $lParam)) {
+            throw "Windows could not queue the requested mouse-up message."
+        }
         Start-Sleep -Milliseconds 50
     }
 }
 
-function Send-Drag([IntPtr]$hwnd, [int]$fromX, [int]$fromY, [int]$toX, [int]$toY) {
-    $start = New-Object OCUWin32+POINT
-    $start.X = $fromX
-    $start.Y = $fromY
-    [void][OCUWin32]::ScreenToClient($hwnd, [ref]$start)
-    $end = New-Object OCUWin32+POINT
-    $end.X = $toX
-    $end.Y = $toY
-    [void][OCUWin32]::ScreenToClient($hwnd, [ref]$end)
+function Send-BackgroundDrag($process, [IntPtr]$hwnd, [int]$fromX, [int]$fromY, [int]$toX, [int]$toY) {
+    Assert-AppScopedMessageTarget $process $hwnd
+    $start = Convert-ScreenPointToAppClient $process $hwnd $fromX $fromY
+    $end = Convert-ScreenPointToAppClient $process $hwnd $toX $toY
 
+    # App-scoped messages are a non-physical best-effort path; they never move the system pointer.
     $steps = 12
     $startParam = ConvertTo-LParam $start.X $start.Y
-    [void][OCUWin32]::PostMessage($hwnd, $WM_MOUSEMOVE, [IntPtr]::Zero, $startParam)
-    [void][OCUWin32]::PostMessage($hwnd, $WM_LBUTTONDOWN, [IntPtr]1, $startParam)
+    Assert-AppScopedMessageTarget $process $hwnd
+    if (-not [OCUWin32]::PostMessage($hwnd, $WM_MOUSEMOVE, [IntPtr]::Zero, $startParam)) {
+        throw "Windows could not queue the requested background drag move message."
+    }
+    Assert-AppScopedMessageTarget $process $hwnd
+    if (-not [OCUWin32]::PostMessage($hwnd, $WM_LBUTTONDOWN, [IntPtr]1, $startParam)) {
+        throw "Windows could not queue the requested background drag mouse-down message."
+    }
     for ($i = 1; $i -le $steps; $i++) {
         $x = [int][math]::Round($start.X + (($end.X - $start.X) * $i / $steps))
         $y = [int][math]::Round($start.Y + (($end.Y - $start.Y) * $i / $steps))
-        [void][OCUWin32]::PostMessage($hwnd, $WM_MOUSEMOVE, [IntPtr]1, (ConvertTo-LParam $x $y))
+        Assert-AppScopedMessageTarget $process $hwnd
+        if (-not [OCUWin32]::PostMessage($hwnd, $WM_MOUSEMOVE, [IntPtr]1, (ConvertTo-LParam $x $y))) {
+            throw "Windows could not queue the requested background drag move message."
+        }
         Start-Sleep -Milliseconds 20
     }
-    [void][OCUWin32]::PostMessage($hwnd, $WM_LBUTTONUP, [IntPtr]::Zero, (ConvertTo-LParam $end.X $end.Y))
+    Assert-AppScopedMessageTarget $process $hwnd
+    if (-not [OCUWin32]::PostMessage($hwnd, $WM_LBUTTONUP, [IntPtr]::Zero, (ConvertTo-LParam $end.X $end.Y))) {
+        throw "Windows could not queue the requested background drag mouse-up message."
+    }
 }
 
-function Send-Scroll([IntPtr]$hwnd, [int]$screenX, [int]$screenY, [string]$direction, [double]$pages) {
-    $point = New-Object OCUWin32+POINT
-    $point.X = $screenX
-    $point.Y = $screenY
-    [void][OCUWin32]::ScreenToClient($hwnd, [ref]$point)
+function Send-Scroll($process, [IntPtr]$hwnd, [int]$screenX, [int]$screenY, [string]$direction, [double]$pages) {
+    $point = Convert-ScreenPointToAppClient $process $hwnd $screenX $screenY
     $lParam = ConvertTo-LParam $point.X $point.Y
     $delta = [int][math]::Round(120 * $pages)
     $message = $WM_MOUSEWHEEL
@@ -205,18 +643,28 @@ function Send-Scroll([IntPtr]$hwnd, [int]$screenX, [int]$screenY, [string]$direc
     if ($direction -eq "left" -or $direction -eq "right") {
         $message = $WM_MOUSEHWHEEL
     }
-    [void][OCUWin32]::PostMessage($hwnd, $message, (ConvertTo-WheelWParam $delta), $lParam)
+    Assert-AppScopedMessageTarget $process $hwnd
+    if (-not [OCUWin32]::PostMessage($hwnd, $message, (ConvertTo-WheelWParam $delta), $lParam)) {
+        throw "Windows could not queue the requested app-scoped scroll message."
+    }
 }
 
-function Send-Text([IntPtr]$hwnd, [string]$text) {
+function Send-Text($process, [IntPtr]$hwnd, [string]$text) {
+    Assert-AppScopedMessageTarget $process $hwnd
     foreach ($char in $text.ToCharArray()) {
-        [void][OCUWin32]::PostMessage($hwnd, $WM_CHAR, [IntPtr][int][char]$char, [IntPtr]::Zero)
+        Assert-AppScopedMessageTarget $process $hwnd
+        if (-not [OCUWin32]::PostMessage($hwnd, $WM_CHAR, [IntPtr][int][char]$char, [IntPtr]::Zero)) {
+            throw "Windows could not queue the requested app-scoped text message."
+        }
         Start-Sleep -Milliseconds 8
     }
 }
 
-function Send-TextToEditHandle([IntPtr]$hwnd, [string]$text, $element) {
+function Send-TextToEditHandle($process, [IntPtr]$hwnd, [string]$text, $element) {
     if ($hwnd -eq [IntPtr]::Zero) {
+        return $false
+    }
+    if (-not (Test-HwndOwnedByProcess $hwnd $process)) {
         return $false
     }
 
@@ -265,7 +713,23 @@ function Get-VirtualKey([string]$key) {
     throw "Unsupported key: $key"
 }
 
-function Send-Key([IntPtr]$hwnd, [string]$key) {
+function Get-KeyInputEventFlags([int]$virtualKey) {
+    switch ($virtualKey) {
+        0x21 { return [uint32]$KEYEVENTF_EXTENDEDKEY }
+        0x22 { return [uint32]$KEYEVENTF_EXTENDEDKEY }
+        0x23 { return [uint32]$KEYEVENTF_EXTENDEDKEY }
+        0x24 { return [uint32]$KEYEVENTF_EXTENDEDKEY }
+        0x25 { return [uint32]$KEYEVENTF_EXTENDEDKEY }
+        0x26 { return [uint32]$KEYEVENTF_EXTENDEDKEY }
+        0x27 { return [uint32]$KEYEVENTF_EXTENDEDKEY }
+        0x28 { return [uint32]$KEYEVENTF_EXTENDEDKEY }
+        0x2D { return [uint32]$KEYEVENTF_EXTENDEDKEY }
+        0x2E { return [uint32]$KEYEVENTF_EXTENDEDKEY }
+    }
+    return [uint32]0
+}
+
+function Get-KeyInputParts([string]$key) {
     $parts = $key -split "\+"
     $main = $parts[$parts.Length - 1]
     $modifiers = @()
@@ -278,19 +742,33 @@ function Send-Key([IntPtr]$hwnd, [string]$key) {
             "super" { $modifiers += 0x5B }
             "win" { $modifiers += 0x5B }
             "cmd" { $modifiers += 0x5B }
+            default { throw "Unsupported modifier: $($parts[$i])" }
         }
     }
-    foreach ($modifier in $modifiers) {
-        [void][OCUWin32]::PostMessage($hwnd, $WM_KEYDOWN, [IntPtr]$modifier, [IntPtr]::Zero)
+    $virtualKey = [int](Get-VirtualKey $main)
+    return [pscustomobject]@{
+        modifiers = @($modifiers)
+        virtualKey = $virtualKey
+        eventFlags = Get-KeyInputEventFlags $virtualKey
     }
-    $vk = Get-VirtualKey $main
-    [void][OCUWin32]::PostMessage($hwnd, $WM_KEYDOWN, [IntPtr]$vk, [IntPtr]::Zero)
-    Start-Sleep -Milliseconds 25
-    [void][OCUWin32]::PostMessage($hwnd, $WM_KEYUP, [IntPtr]$vk, [IntPtr]::Zero)
-    [array]::Reverse($modifiers)
-    foreach ($modifier in $modifiers) {
-        [void][OCUWin32]::PostMessage($hwnd, $WM_KEYUP, [IntPtr]$modifier, [IntPtr]::Zero)
+}
+
+function Send-InteractiveKey($process, [IntPtr]$hwnd, [string]$key) {
+    Ensure-InteractiveKeyboardTarget $process $hwnd
+    $keyParts = Get-KeyInputParts $key
+    $records = @()
+    foreach ($modifier in $keyParts.modifiers) {
+        $records += [OCUWin32]::NewKeyboardInput([uint16]$modifier, 0)
     }
+    $records += [OCUWin32]::NewKeyboardInput([uint16]$keyParts.virtualKey, $keyParts.eventFlags)
+    $records += [OCUWin32]::NewKeyboardInput([uint16]$keyParts.virtualKey, [uint32]($keyParts.eventFlags -bor $KEYEVENTF_KEYUP))
+    $releaseModifiers = @($keyParts.modifiers)
+    [array]::Reverse($releaseModifiers)
+    foreach ($modifier in $releaseModifiers) {
+        $records += [OCUWin32]::NewKeyboardInput([uint16]$modifier, $KEYEVENTF_KEYUP)
+    }
+
+    Submit-InteractiveInputRecords $records "key press"
 }
 
 function Resolve-App([string]$query) {
@@ -299,20 +777,21 @@ function Resolve-App([string]$query) {
     if ($processQuery.EndsWith(".exe", [System.StringComparison]::OrdinalIgnoreCase)) {
         $processQuery = $processQuery.Substring(0, $processQuery.Length - 4)
     }
-    $processes = @(Get-Process | Where-Object { $_.MainWindowHandle -ne 0 })
+    $processes = @(Get-Process | Where-Object { $PSItem.MainWindowHandle -ne 0 })
     $pidValue = 0
     if ([int]::TryParse($normalized, [ref]$pidValue)) {
-        $match = $processes | Where-Object { $_.Id -eq $pidValue } | Select-Object -First 1
+        $match = $processes | Where-Object { $PSItem.Id -eq $pidValue } | Select-Object -First 1
         if ($null -ne $match) {
             return $match
         }
     }
 
+    $escapedQuery = [System.Management.Automation.WildcardPattern]::Escape($normalized)
     $match = $processes | Where-Object {
-        $_.ProcessName -ieq $processQuery -or
-        "$($_.ProcessName).exe" -ieq $normalized -or
-        $_.MainWindowTitle -ieq $normalized -or
-        $_.MainWindowTitle -ilike "*$normalized*"
+        $PSItem.ProcessName -ieq $processQuery -or
+        ("{0}.exe" -f $PSItem.ProcessName) -ieq $normalized -or
+        $PSItem.MainWindowTitle -ieq $normalized -or
+        $PSItem.MainWindowTitle -ilike "*$escapedQuery*"
     } | Select-Object -First 1
     if ($null -ne $match) {
         return $match
@@ -320,7 +799,10 @@ function Resolve-App([string]$query) {
 
     if (Test-EnvFlagEnabled "OPEN_COMPUTER_USE_WINDOWS_ALLOW_APP_LAUNCH") {
         try {
-            $started = Start-Process -FilePath $normalized -PassThru
+            $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+            $startInfo.FileName = $normalized
+            $startInfo.UseShellExecute = $true
+            $started = [System.Diagnostics.Process]::Start($startInfo)
             for ($i = 0; $i -lt 20; $i++) {
                 Start-Sleep -Milliseconds 250
                 $candidate = Get-Process -Id $started.Id -ErrorAction SilentlyContinue
@@ -344,7 +826,8 @@ function Get-MainElement($process) {
     if ($children.Count -gt 0) {
         return $children.Item(0)
     }
-    throw "No top-level UI Automation window is available for $($process.ProcessName). Run the Windows runtime in the signed-in desktop session."
+    $processName = $process.ProcessName
+    throw "No top-level UI Automation window is available for ${processName}. Run the Windows runtime in the signed-in desktop session."
 }
 
 function Get-WindowBounds($process, $element) {
@@ -496,7 +979,7 @@ function Get-ElementTitle($record) {
         return $record.name
     }
     if (-not [string]::IsNullOrWhiteSpace($record.automationId)) {
-        return "ID: $($record.automationId)"
+        return ("ID: " + $record.automationId)
     }
     return ""
 }
@@ -606,7 +1089,11 @@ function Capture-WindowPngBase64($bounds, $hwnd, [bool]$IncludeImage) {
         $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
         $graphics.Clear([System.Drawing.Color]::Black)
         $captured = $false
-        if ($null -ne $hwnd -and [OCUWin32]::IsWindow([IntPtr]$hwnd)) {
+        $foregroundHwnd = [OCUWin32]::GetForegroundWindow()
+        if ($foregroundHwnd -eq [IntPtr]$hwnd) {
+            $graphics.CopyFromScreen([int][math]::Round($bounds.x), [int][math]::Round($bounds.y), 0, 0, $bitmap.Size)
+            $captured = $true
+        } elseif ($null -ne $hwnd -and [OCUWin32]::IsWindow([IntPtr]$hwnd)) {
             $hdc = $graphics.GetHdc()
             try {
                 $captured = [OCUWin32]::PrintWindow([IntPtr]$hwnd, $hdc, 0)
@@ -669,20 +1156,38 @@ function Get-SelectedText($processId, $TextLimit = $script:DefaultTextLimit) {
     return $null
 }
 
-function Build-Snapshot([string]$query, $TextLimit = $script:DefaultTextLimit, [int]$MaxTreeNodes = $script:AccessibilityTreeMaxNodeCount, [int]$MaxTreeDepth = $script:AccessibilityTreeMaxDepth, [bool]$IncludeImage = $false) {
-    $process = Resolve-App $query
+function Get-ProcessTargetHandle($process, $element) {
+    $mainHwnd = [IntPtr]$process.MainWindowHandle
+    if (Test-HwndOwnedByProcess $mainHwnd $process) {
+        return $mainHwnd
+    }
+    $elementHwnd = Get-NativeWindowHandle $element
+    if (Test-HwndOwnedByProcess $elementHwnd $process) {
+        return $elementHwnd
+    }
+    return [IntPtr]::Zero
+}
+
+function Build-SnapshotForProcess($process, [string]$query, $TextLimit = $script:DefaultTextLimit, [int]$MaxTreeNodes = $script:AccessibilityTreeMaxNodeCount, [int]$MaxTreeDepth = $script:AccessibilityTreeMaxDepth, [bool]$IncludeImage = $false) {
     $element = Get-MainElement $process
+    $targetHwnd = Get-ProcessTargetHandle $process $element
+    if ($targetHwnd -eq [IntPtr]::Zero) {
+        Throw-TargetChanged
+    }
     $bounds = Get-WindowBounds $process $element
+    $startTimeTicks = Get-ProcessStartTimeTicks $process
     $rendered = Render-Tree $element $bounds $TextLimit $MaxTreeNodes $MaxTreeDepth
     [pscustomobject]@{
         app = [pscustomobject]@{
             name = $process.ProcessName
             bundleIdentifier = $process.ProcessName
             pid = [int]$process.Id
+            processStartTimeTicks = $startTimeTicks
+            mainWindowHandle = [int64]$targetHwnd.ToInt64()
         }
         windowTitle = Limit-Text $process.MainWindowTitle $TextLimit
         windowBounds = $bounds
-        screenshotPngBase64 = Capture-WindowPngBase64 $bounds $process.MainWindowHandle $IncludeImage
+        screenshotPngBase64 = Capture-WindowPngBase64 $bounds $targetHwnd $IncludeImage
         treeLines = @($rendered.lines)
         focusedSummary = Get-FocusedSummary $process.Id $TextLimit
         selectedText = Get-SelectedText $process.Id $TextLimit
@@ -690,9 +1195,14 @@ function Build-Snapshot([string]$query, $TextLimit = $script:DefaultTextLimit, [
     }
 }
 
+function Build-Snapshot([string]$query, $TextLimit = $script:DefaultTextLimit, [int]$MaxTreeNodes = $script:AccessibilityTreeMaxNodeCount, [int]$MaxTreeDepth = $script:AccessibilityTreeMaxDepth, [bool]$IncludeImage = $false) {
+    $process = Resolve-App $query
+    return Build-SnapshotForProcess $process $query $TextLimit $MaxTreeNodes $MaxTreeDepth $IncludeImage
+}
+
 function List-Apps {
     $lines = New-Object System.Collections.Generic.List[string]
-    foreach ($process in (Get-Process | Where-Object { $_.MainWindowHandle -ne 0 } | Sort-Object ProcessName, Id)) {
+    foreach ($process in (Get-Process | Where-Object { $PSItem.MainWindowHandle -ne 0 } | Sort-Object ProcessName, Id)) {
         $title = $process.MainWindowTitle
         if ([string]::IsNullOrWhiteSpace($title)) {
             $title = "untitled"
@@ -815,7 +1325,7 @@ function Invoke-SecondaryAction($element, [string]$action) {
             return
         }
     }
-    throw "$action is not a valid secondary action for $($operation.element.index)"
+    throw ("$action is not a valid secondary action for " + $operation.element.index)
 }
 
 function Invoke-Scroll($element, [string]$direction, [double]$pages) {
@@ -879,6 +1389,44 @@ function Get-NativeWindowHandle($element) {
     return [IntPtr]$handle
 }
 
+function Resolve-AppPostTargetHandle($process, [IntPtr]$mainHwnd, $element, [int]$screenX, [int]$screenY) {
+    Assert-AppScopedMessageTarget $process $mainHwnd
+    Assert-ScreenPointInHwnd $mainHwnd $screenX $screenY
+
+    if ($null -ne $element) {
+        $elementHwnd = Get-NativeWindowHandle $element
+        if ($elementHwnd -ne [IntPtr]::Zero) {
+            if (-not (Test-HwndOwnedByProcess $elementHwnd $process)) {
+                Throw-TargetChanged
+            }
+            Assert-AppPostDescendant $mainHwnd $elementHwnd $screenX $screenY
+            return $elementHwnd
+        }
+        if ((Get-ElementString $element "FrameworkId") -eq "WPF") {
+            throw "click_method 'app_post' requires a native HWND target for this WPF element; use click_method 'global' with the explicit interactive-input configuration."
+        }
+    } elseif ((Get-ElementString (Get-MainElement $process) "FrameworkId") -eq "WPF") {
+        throw "click_method 'app_post' cannot target WPF coordinate input without a native child HWND; use click_method 'global' with the explicit interactive-input configuration."
+    }
+
+    $point = New-Object OCUWin32+POINT
+    $point.X = $screenX
+    $point.Y = $screenY
+    if (-not [OCUWin32]::ScreenToClient($mainHwnd, [ref]$point)) {
+        throw "Windows could not convert the requested app-post coordinates."
+    }
+    $child = [OCUWin32]::ChildWindowFromPointEx($mainHwnd, $point, ($CWP_SKIPINVISIBLE -bor $CWP_SKIPDISABLED -bor $CWP_SKIPTRANSPARENT))
+    if ($child -ne [IntPtr]::Zero) {
+        if (-not (Test-HwndOwnedByProcess $child $process)) {
+            Throw-TargetChanged
+        }
+        Assert-AppPostDescendant $mainHwnd $child $screenX $screenY
+        return $child
+    }
+    Assert-AppPostDescendant $mainHwnd $mainHwnd $screenX $screenY
+    return $mainHwnd
+}
+
 function Test-TextWindowHandleCandidate($process, $element) {
     if ($null -eq $element) {
         return $false
@@ -926,7 +1474,7 @@ function Find-TextEntryWindowHandle($process, $preferredElement) {
 function Invoke-TypeText($process, [string]$text) {
     $element = Find-TextEntryElement $process
     $targetHwnd = Find-TextEntryWindowHandle $process $element
-    if ($targetHwnd -ne [IntPtr]::Zero -and (Send-TextToEditHandle $targetHwnd $text $element)) {
+    if ($targetHwnd -ne [IntPtr]::Zero -and (Send-TextToEditHandle $process $targetHwnd $text $element)) {
         return $true
     }
 
@@ -956,10 +1504,16 @@ try {
     if ($operation.tool -eq "list_apps") {
         $response = [pscustomobject]@{ ok = $true; text = (List-Apps) }
     } elseif ($operation.tool -eq "get_app_state") {
-        $response = [pscustomobject]@{ ok = $true; snapshot = (Build-Snapshot $operation.app (Resolve-TextLimit $operation.text_limit) ([int]$operation.max_tree_nodes) ([int]$operation.max_tree_depth) ([bool]$operation.include_image)) }
+        if ([int]$operation.expectedPid -gt 0) {
+            $target = Resolve-SnapshotActionTarget $operation
+            $response = [pscustomobject]@{ ok = $true; snapshot = (Build-SnapshotForProcess $target.process $operation.app (Resolve-TextLimit $operation.text_limit) ([int]$operation.max_tree_nodes) ([int]$operation.max_tree_depth) ([bool]$operation.include_image)) }
+        } else {
+            $response = [pscustomobject]@{ ok = $true; snapshot = (Build-Snapshot $operation.app (Resolve-TextLimit $operation.text_limit) ([int]$operation.max_tree_nodes) ([int]$operation.max_tree_depth) ([bool]$operation.include_image)) }
+        }
     } else {
-        $process = Resolve-App $operation.app
-        $hwnd = [IntPtr]$process.MainWindowHandle
+        $target = Resolve-SnapshotActionTarget $operation
+        $process = $target.process
+        $hwnd = $target.hwnd
         $windowBounds = $operation.windowBounds
         $element = Find-Element $process $operation.element
 
@@ -971,12 +1525,13 @@ try {
                 if ($clickMethod -eq "accessibility") {
                     if ($null -eq $element) { throw "click_method 'accessibility' requires element_index" }
                     if ($operation.mouse_button -eq "right" -or $operation.mouse_button -eq "middle") {
-                        throw "click_method 'accessibility' does not support mouse_button '$($operation.mouse_button)'"
+                        throw ("click_method 'accessibility' does not support mouse_button '" + $operation.mouse_button + "'")
                     }
                     if (-not (Invoke-PreferredClick $element)) {
                         throw "click_method 'accessibility' could not click the requested element"
                     }
                 } elseif ($clickMethod -eq "app_post") {
+                    Assert-SnapshotCoordinateBounds $hwnd $windowBounds
                     if ($null -ne $operation.element -and $null -ne $operation.element.frame) {
                         $point = Get-ScreenPoint $operation.element.frame $windowBounds
                     } else {
@@ -985,9 +1540,23 @@ try {
                             y = [int][math]::Round($windowBounds.y + [double]$operation.y)
                         }
                     }
-                    Send-MouseClick $hwnd $point.x $point.y $operation.mouse_button ([int]$operation.click_count)
+                    $targetHwnd = Resolve-AppPostTargetHandle $process $hwnd $element $point.x $point.y
+                    if ($operation.mouse_button -eq "left" -and (Test-NativeButtonElement $element)) {
+                        Send-NativeButtonClick $process $targetHwnd ([int]$operation.click_count)
+                    } else {
+                        Send-MouseClick $process $targetHwnd $point.x $point.y $operation.mouse_button ([int]$operation.click_count)
+                    }
                 } elseif ($clickMethod -eq "global") {
-                    throw "click_method 'global' is not supported on Windows"
+                    Assert-SnapshotCoordinateBounds $hwnd $windowBounds
+                    if ($null -ne $operation.element -and $null -ne $operation.element.frame) {
+                        $point = Get-ScreenPoint $operation.element.frame $windowBounds
+                    } else {
+                        $point = [pscustomobject]@{
+                            x = [int][math]::Round($windowBounds.x + [double]$operation.x)
+                            y = [int][math]::Round($windowBounds.y + [double]$operation.y)
+                        }
+                    }
+                    Send-InteractiveMouseClick $process $hwnd $point.x $point.y $operation.mouse_button ([int]$operation.click_count)
                 } elseif ($clickMethod -eq "sky_click") {
                     throw "click_method 'sky_click' is not supported on Windows"
                 } elseif ($clickMethod -eq "auto") {
@@ -996,6 +1565,7 @@ try {
                         $handled = Invoke-PreferredClick $element
                     }
                     if (-not $handled) {
+                        Assert-SnapshotCoordinateBounds $hwnd $windowBounds
                         if ($null -ne $operation.element -and $null -ne $operation.element.frame) {
                             $point = Get-ScreenPoint $operation.element.frame $windowBounds
                         } else {
@@ -1004,14 +1574,14 @@ try {
                                 y = [int][math]::Round($windowBounds.y + [double]$operation.y)
                             }
                         }
-                        Send-MouseClick $hwnd $point.x $point.y $operation.mouse_button ([int]$operation.click_count)
+                        Send-MouseClick $process $hwnd $point.x $point.y $operation.mouse_button ([int]$operation.click_count)
                     }
                 } else {
                     throw "Invalid click_method '$clickMethod'"
                 }
             }
             "perform_secondary_action" {
-                if ($null -eq $element) { throw "unknown element_index '$($operation.element.index)'" }
+                if ($null -eq $element) { throw ("unknown element_index '" + $operation.element.index + "'") }
                 Invoke-SecondaryAction $element $operation.action
             }
             "scroll" {
@@ -1020,23 +1590,36 @@ try {
                     $handled = Invoke-Scroll $element $operation.direction ([double]$operation.pages)
                 }
                 if (-not $handled) {
+                    Assert-SnapshotCoordinateBounds $hwnd $windowBounds
                     $point = Get-ScreenPoint $operation.element.frame $windowBounds
-                    Send-Scroll $hwnd $point.x $point.y $operation.direction ([double]$operation.pages)
+                    Send-Scroll $process $hwnd $point.x $point.y $operation.direction ([double]$operation.pages)
                 }
             }
             "drag" {
-                Send-Drag $hwnd ([int][math]::Round($windowBounds.x + [double]$operation.from_x)) ([int][math]::Round($windowBounds.y + [double]$operation.from_y)) ([int][math]::Round($windowBounds.x + [double]$operation.to_x)) ([int][math]::Round($windowBounds.y + [double]$operation.to_y))
+                Assert-SnapshotCoordinateBounds $hwnd $windowBounds
+                $fromX = [int][math]::Round($windowBounds.x + [double]$operation.from_x)
+                $fromY = [int][math]::Round($windowBounds.y + [double]$operation.from_y)
+                $toX = [int][math]::Round($windowBounds.x + [double]$operation.to_x)
+                $toY = [int][math]::Round($windowBounds.y + [double]$operation.to_y)
+                if (Test-InteractivePointerInputEnabled) {
+                    Send-InteractiveDrag $process $hwnd $fromX $fromY $toX $toY
+                } else {
+                    Send-BackgroundDrag $process $hwnd $fromX $fromY $toX $toY
+                }
             }
             "type_text" {
                 if (-not (Invoke-TypeText $process $operation.text)) {
-                    Send-Text $hwnd $operation.text
+                    Send-Text $process $hwnd $operation.text
                 }
             }
             "press_key" {
-                Send-Key $hwnd $operation.key
+                if (-not (Test-EnvFlagEnabled "OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT")) {
+                    throw "Interactive Windows keyboard input is disabled by default; set OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT=1 and focus the target before sending a key."
+                }
+                Send-InteractiveKey $process $hwnd $operation.key
             }
             "set_value" {
-                if ($null -eq $element) { throw "unknown element_index '$($operation.element.index)'" }
+                if ($null -eq $element) { throw ("unknown element_index '" + $operation.element.index + "'") }
                 $valuePattern = Get-CurrentPatternOrNull $element ([Windows.Automation.ValuePattern]::Pattern)
                 if ($null -eq $valuePattern) {
                     throw "Cannot set a value for an element that is not settable"
@@ -1044,17 +1627,18 @@ try {
                 $valuePattern.SetValue($operation.value)
             }
             default {
-                throw "unsupportedTool(`"$($operation.tool)`")"
+                throw ('unsupportedTool(' + [char]34 + $operation.tool + [char]34 + ')')
             }
         }
 
         Start-Sleep -Milliseconds 120
-        $response = [pscustomobject]@{ ok = $true; snapshot = (Build-Snapshot $operation.app $null $AccessibilityTreeMaxNodeCount $AccessibilityTreeMaxDepth $true) }
+        $response = [pscustomobject]@{ ok = $true; snapshot = (Build-SnapshotForProcess $process $operation.app $null $AccessibilityTreeMaxNodeCount $AccessibilityTreeMaxDepth $true) }
     }
 } catch {
-    $message = $_.Exception.Message
-    if (-not [string]::IsNullOrWhiteSpace($_.ScriptStackTrace)) {
-        $message = "$message at $($_.ScriptStackTrace)"
+    $message = $PSItem.Exception.Message
+    $stackTrace = $PSItem.ScriptStackTrace
+    if (-not [string]::IsNullOrWhiteSpace($stackTrace)) {
+        $message = "$message at $stackTrace"
     }
     $response = [pscustomobject]@{ ok = $false; error = $message }
 }

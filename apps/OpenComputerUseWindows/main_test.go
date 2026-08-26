@@ -21,6 +21,10 @@ func TestClickMethodSchemaAndParser(t *testing.T) {
 	if strings.Join(values, ",") != "auto,accessibility,app_post,sky_click,global" {
 		t.Fatalf("click_method enum = %#v", values)
 	}
+	description := method["description"].(string)
+	if !strings.Contains(description, "global requires explicit foreground and global-pointer environment authorization") {
+		t.Fatalf("click_method description = %q", description)
+	}
 
 	for input, want := range map[string]string{
 		"":              "auto",
@@ -46,19 +50,118 @@ func TestClickMethodSchemaAndParser(t *testing.T) {
 	}
 }
 
-func TestWindowsRejectsUnsupportedGlobalClickBeforeSnapshotLookup(t *testing.T) {
+func TestWindowsGlobalClickRequiresSnapshotBeforeRuntime(t *testing.T) {
 	x, y := 10.0, 20.0
 	result := newService().click("Notepad", "", &x, &y, 1, "left", "global")
-	if !result.IsError || result.Content[0].Text != "click_method 'global' is not supported on Windows" {
+	if !result.IsError || result.Content[0].Text != "No app state is available for Notepad. Run get_app_state before action tools." {
 		t.Fatalf("global click result = %#v", result)
 	}
 }
 
-func TestWindowsRejectsUnsupportedSkyClickBeforeSnapshotLookup(t *testing.T) {
-	x, y := 10.0, 20.0
-	result := newService().click("Notepad", "", &x, &y, 1, "left", "sky_click")
-	if !result.IsError || result.Content[0].Text != "click_method 'sky_click' is not supported on Windows" {
-		t.Fatalf("sky_click result = %#v", result)
+func TestSnapshotIdentityIsMarshaledIntoActionRequests(t *testing.T) {
+	snapshot := &appSnapshot{
+		App: appDescriptor{
+			PID:                   1234,
+			ProcessStartTimeTicks: 987654321,
+			MainWindowHandle:      4321,
+		},
+		WindowBounds: &frame{X: 10, Y: 20, Width: 300, Height: 200},
+	}
+	request, err := bindSnapshotTarget(snapshot, psRequest{Tool: "drag", App: "fixture"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(encoded)
+	for _, marker := range []string{
+		`"expectedPid":1234`,
+		`"expectedProcessStartTimeTicks":987654321`,
+		`"expectedMainWindowHandle":4321`,
+		`"windowBounds":{"x":10,"y":20,"width":300,"height":200}`,
+	} {
+		if !strings.Contains(text, marker) {
+			t.Fatalf("action request missing %s: %s", marker, text)
+		}
+	}
+}
+
+func TestSnapshotCacheRejectsAmbiguousProcessAliases(t *testing.T) {
+	service := newService()
+	first := &appSnapshot{App: appDescriptor{Name: "pwsh", BundleIdentifier: "pwsh", PID: 1001, ProcessStartTimeTicks: 10, MainWindowHandle: 101}, WindowTitle: "Fixture A"}
+	second := &appSnapshot{App: appDescriptor{Name: "pwsh", BundleIdentifier: "pwsh", PID: 1002, ProcessStartTimeTicks: 20, MainWindowHandle: 202}, WindowTitle: "Fixture B"}
+	service.rememberSnapshot("Fixture A", first)
+	service.rememberSnapshot("Fixture B", second)
+
+	if got := service.currentSnapshot("Fixture A"); got != first {
+		t.Fatalf("exact title A snapshot = %#v, want first", got)
+	}
+	if got := service.currentSnapshot("Fixture B"); got != second {
+		t.Fatalf("exact title B snapshot = %#v, want second", got)
+	}
+	if got := service.currentSnapshot("1001"); got != first {
+		t.Fatalf("PID A snapshot = %#v, want first", got)
+	}
+	if got := service.currentSnapshot("pwsh"); got != nil {
+		t.Fatalf("shared process alias must be ambiguous, got %#v", got)
+	}
+	result := service.snapshotActionError("pwsh")
+	if !result.IsError || !strings.Contains(result.Content[0].Text, "matches multiple cached targets") {
+		t.Fatalf("ambiguous alias error = %#v", result)
+	}
+}
+
+func TestSnapshotIdentityRejectsIncompleteSnapshot(t *testing.T) {
+	for _, snapshot := range []*appSnapshot{
+		{},
+		{App: appDescriptor{PID: 1234}},
+		{App: appDescriptor{PID: 1234, ProcessStartTimeTicks: 1}},
+	} {
+		if _, err := bindSnapshotTarget(snapshot, psRequest{Tool: "click"}); err == nil {
+			t.Fatalf("incomplete snapshot %#v was accepted", snapshot)
+		}
+	}
+}
+
+func TestWindowsRuntimeBindsActionsToSnapshotIdentity(t *testing.T) {
+	for _, marker := range []string{
+		"function Resolve-SnapshotActionTarget($operation)",
+		"Get-Process -Id $expectedPid",
+		"Get-ProcessStartTimeTicks $process",
+		"$hwnd.ToInt64() -ne $expectedMainWindowHandle",
+		"Target changed; call get_app_state again.",
+		"Build-SnapshotForProcess $process $operation.app",
+		"$escapedQuery = [System.Management.Automation.WildcardPattern]::Escape($normalized)",
+		"$PSItem.MainWindowTitle -ilike \"*$escapedQuery*\"",
+	} {
+		if !strings.Contains(windowsRuntimeScript, marker) {
+			t.Fatalf("snapshot identity contract missing %q", marker)
+		}
+	}
+	if strings.Contains(windowsRuntimeScript, "$process = Resolve-App $operation.app") {
+		t.Fatal("actions must not re-resolve the mutable app query")
+	}
+}
+
+func TestWindowsRuntimeGuardsCoordinateAndAppScopedMessagePaths(t *testing.T) {
+	for _, marker := range []string{
+		"function Assert-SnapshotCoordinateBounds",
+		"function Assert-AppScopedMessageTarget",
+		"function Convert-ScreenPointToAppClient",
+		"function Send-MouseClick($process",
+		"function Send-Scroll($process",
+		"function Test-HwndDescendantOf",
+		"function Assert-ScreenPointInHwnd",
+		"function Assert-AppPostDescendant",
+		"Assert-AppPostDescendant $mainHwnd $elementHwnd $screenX $screenY",
+		"Assert-ScreenPointInHwnd $hwnd $screenX $screenY",
+		"if (-not [OCUWin32]::PostMessage",
+	} {
+		if !strings.Contains(windowsRuntimeScript, marker) {
+			t.Fatalf("app-scoped safety contract missing %q", marker)
+		}
 	}
 }
 
@@ -317,17 +420,199 @@ func TestCLIHelpMentionsWindowsRuntime(t *testing.T) {
 }
 
 func TestWindowsRuntimeForegroundActionsRequireOptIn(t *testing.T) {
-	if !strings.Contains(windowsRuntimeScript, "OPEN_COMPUTER_USE_WINDOWS_ALLOW_APP_LAUNCH") {
-		t.Fatal("Windows app launch fallback must remain opt-in")
+	for _, marker := range []string{
+		"OPEN_COMPUTER_USE_WINDOWS_ALLOW_APP_LAUNCH",
+		"OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOCUS_ACTIONS",
+		"OPEN_COMPUTER_USE_WINDOWS_ALLOW_UIA_TEXT_FALLBACK",
+		"OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT",
+		"OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS",
+		"SendInputRecords",
+		"KEYEVENTF_EXTENDEDKEY",
+		"ChildWindowFromPointEx",
+		"WindowFromPoint",
+		"BM_CLICK",
+		"Send-NativeButtonClick",
+	} {
+		if !strings.Contains(windowsRuntimeScript, marker) {
+			t.Fatalf("Windows runtime must retain opt-in marker %q", marker)
+		}
 	}
-	if !strings.Contains(windowsRuntimeScript, "OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOCUS_ACTIONS") {
-		t.Fatal("Windows SetFocus action must remain opt-in")
-	}
-	if !strings.Contains(windowsRuntimeScript, "OPEN_COMPUTER_USE_WINDOWS_ALLOW_UIA_TEXT_FALLBACK") {
-		t.Fatal("Windows UIA text fallback must remain opt-in")
+	if strings.Contains(windowsRuntimeScript, "AttachThreadInput") {
+		t.Fatal("Windows interactive input must not bypass foreground policy with AttachThreadInput")
 	}
 	if !strings.Contains(serverInstructions, "does not auto-launch apps, perform SetFocus, or use UIA text fallback by default") {
 		t.Fatal("MCP instructions must document the Windows background-focus policy")
+	}
+	if !strings.Contains(serverInstructions, "Global click and physical drag require both") {
+		t.Fatal("MCP instructions must document the separate global pointer authorization")
+	}
+	if !strings.Contains(serverInstructions, "`press_key` is rejected unless the foreground-input flag is set") {
+		t.Fatal("MCP instructions must document keyboard input authorization")
+	}
+}
+
+func TestWindowsRuntimeDoesNotReplayRejectedInputBatches(t *testing.T) {
+	for _, marker := range []string{
+		"if ([int]$accepted -eq $recordCount)",
+		"SendInput does not provide a reliable error code for rejected records",
+		"No retry was attempted because SendInput submission is not safely replayable",
+		"Submit-InteractiveInputRecords $records \"key press\"",
+	} {
+		if !strings.Contains(windowsRuntimeScript, marker) {
+			t.Fatalf("Windows runtime batch failure contract missing %q", marker)
+		}
+	}
+	for _, forbidden := range []string{
+		"singleRecord",
+		"$singleAccepted",
+		"$cleanup = @",
+		"SendInputRecords($cleanupRecords)",
+		"_lastSendInputError",
+		"GetLastSendInputError",
+		"Marshal.GetLastWin32Error()",
+	} {
+		if strings.Contains(windowsRuntimeScript, forbidden) {
+			t.Fatalf("Windows runtime must not submit an extra keyboard cleanup batch %q", forbidden)
+		}
+	}
+}
+
+func TestWindowsRuntimeSeparatesPointerAndKeyboardAuthorization(t *testing.T) {
+	for _, marker := range []string{
+		"function Test-InteractivePointerInputEnabled()",
+		"Assert-InteractiveDragPath $process $hwnd $fromX $fromY $toX $toY $steps",
+		"if (Test-InteractivePointerInputEnabled)",
+		"function Test-ProcessOwnsForegroundWindow($process, [IntPtr]$expectedHwnd)",
+		"Test-HwndDescendantOf $hwnd $hitWindow",
+		"OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOCUS_ACTIONS",
+		"if (-not [OCUWin32]::SetForegroundWindow($hwnd))",
+		"focus it with an authorized global click",
+	} {
+		if !strings.Contains(windowsRuntimeScript, marker) {
+			t.Fatalf("Windows runtime authorization boundary missing %q", marker)
+		}
+	}
+	if strings.Contains(windowsRuntimeScript, `if (Test-EnvFlagEnabled "OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT") {
+					Send-InteractiveDrag`) {
+		t.Fatal("drag must not select global input from keyboard authorization alone")
+	}
+}
+
+func TestWindowsRuntimeKeepsBackgroundDragAppScoped(t *testing.T) {
+	const backgroundStart = "function Send-BackgroundDrag($process"
+	const backgroundEnd = "function Send-Scroll"
+	start := strings.Index(windowsRuntimeScript, backgroundStart)
+	if start < 0 {
+		t.Fatal("Windows runtime must retain an explicitly named app-scoped background drag helper")
+	}
+	endOffset := strings.Index(windowsRuntimeScript[start:], backgroundEnd)
+	if endOffset < 0 {
+		t.Fatal("could not bound background drag helper")
+	}
+	backgroundDrag := windowsRuntimeScript[start : start+endOffset]
+	for _, marker := range []string{
+		"Assert-AppScopedMessageTarget $process $hwnd",
+		"if (-not [OCUWin32]::PostMessage",
+		"background drag mouse-down message",
+		"background drag mouse-up message",
+	} {
+		if !strings.Contains(backgroundDrag, marker) {
+			t.Fatalf("background drag safety contract missing %q", marker)
+		}
+	}
+	if strings.Contains(backgroundDrag, "SendInputRecords") {
+		t.Fatal("background drag must not become physical global input")
+	}
+	if strings.Contains(windowsRuntimeScript, "function Send-Drag") {
+		t.Fatal("legacy unguarded background drag helper must not remain")
+	}
+
+	dragStart := strings.Index(windowsRuntimeScript, `"drag" {`)
+	if dragStart < 0 {
+		t.Fatal("could not find drag dispatch branch")
+	}
+	dragEndOffset := strings.Index(windowsRuntimeScript[dragStart:], `"type_text" {`)
+	if dragEndOffset < 0 {
+		t.Fatal("could not bound drag dispatch branch")
+	}
+	dragBranch := windowsRuntimeScript[dragStart : dragStart+dragEndOffset]
+	for _, marker := range []string{
+		"if (Test-InteractivePointerInputEnabled)",
+		"Send-InteractiveDrag $process $hwnd $fromX $fromY $toX $toY",
+		"Send-BackgroundDrag $process $hwnd $fromX $fromY $toX $toY",
+	} {
+		if !strings.Contains(dragBranch, marker) {
+			t.Fatalf("drag dispatch contract missing %q", marker)
+		}
+	}
+}
+
+func TestWindowsRuntimeRoutesGlobalClickExplicitly(t *testing.T) {
+	clickStart := strings.Index(windowsRuntimeScript, `"click" {`)
+	if clickStart < 0 {
+		t.Fatal("could not find click dispatch branch")
+	}
+	clickEndOffset := strings.Index(windowsRuntimeScript[clickStart:], `"perform_secondary_action" {`)
+	if clickEndOffset < 0 {
+		t.Fatal("could not bound click dispatch branch")
+	}
+	clickBranch := windowsRuntimeScript[clickStart : clickStart+clickEndOffset]
+	if strings.Count(clickBranch, "Send-InteractiveMouseClick") != 1 {
+		t.Fatal("only explicit click_method 'global' may use physical global input")
+	}
+	globalStart := strings.Index(clickBranch, `} elseif ($clickMethod -eq "global") {`)
+	if globalStart < 0 {
+		t.Fatal("could not find explicit global click branch")
+	}
+	globalEndOffset := strings.Index(clickBranch[globalStart:], `} elseif ($clickMethod -eq "sky_click") {`)
+	if globalEndOffset < 0 {
+		t.Fatal("could not bound explicit global click branch")
+	}
+	if !strings.Contains(clickBranch[globalStart:globalStart+globalEndOffset], "Send-InteractiveMouseClick") {
+		t.Fatal("explicit global click branch must use physical global input")
+	}
+}
+
+func TestWindowsPressKeyRejectsWithoutForegroundAuthorization(t *testing.T) {
+	for _, marker := range []string{
+		`"press_key" {`,
+		`if (-not (Test-EnvFlagEnabled "OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT"))`,
+		"Interactive Windows keyboard input is disabled by default",
+		"Send-InteractiveKey $process $hwnd $operation.key",
+	} {
+		if !strings.Contains(windowsRuntimeScript, marker) {
+			t.Fatalf("Windows press_key authorization guard missing %q", marker)
+		}
+	}
+	if strings.Contains(windowsRuntimeScript, "Send-Key") {
+		t.Fatal("Windows press_key must not retain an unauthorized PostMessage keyboard fallback")
+	}
+}
+
+func TestWindowsRuntimeValidatesInteractiveDragPath(t *testing.T) {
+	if !strings.Contains(windowsRuntimeScript, "function Assert-InteractiveDragPath") {
+		t.Fatal("interactive drag must validate the full pointer path")
+	}
+	if !strings.Contains(windowsRuntimeScript, "for ($i = 0; $i -le $steps; $i++)") {
+		t.Fatal("interactive drag path validation must include both endpoints")
+	}
+	if !strings.Contains(windowsRuntimeScript, "Ensure-InteractivePointerTarget $process $hwnd $x $y") {
+		t.Fatal("interactive drag path validation must check each sampled point")
+	}
+}
+
+func TestWindowsAppPostNativeButtonContract(t *testing.T) {
+	for _, marker := range []string{
+		"$BM_CLICK = 0x00F5",
+		"function Send-NativeButtonClick",
+		"Test-NativeButtonElement $element",
+		"Send-NativeButtonClick $process $targetHwnd ([int]$operation.click_count)",
+		"requires a native HWND target for this WPF element",
+		"cannot target WPF coordinate input without a native child HWND",
+	} {
+		if !strings.Contains(windowsRuntimeScript, marker) {
+			t.Fatalf("Windows app_post contract missing %q", marker)
+		}
 	}
 }
 
@@ -345,10 +630,12 @@ func TestWindowsRuntimeScreenshotCaptureContract(t *testing.T) {
 	for _, marker := range []string{
 		"[bool]$IncludeImage = $false",
 		"[OCUWin32]::PrintWindow",
+		"$foregroundHwnd = [OCUWin32]::GetForegroundWindow()",
+		"if ($foregroundHwnd -eq [IntPtr]$hwnd)",
 		"Test-BitmapHasVisiblePixels",
 		"Normalize-BitmapAlpha",
 		"CopyFromScreen",
-		"screenshotPngBase64 = Capture-WindowPngBase64 $bounds $process.MainWindowHandle $IncludeImage",
+		"screenshotPngBase64 = Capture-WindowPngBase64 $bounds $targetHwnd $IncludeImage",
 	} {
 		if !strings.Contains(windowsRuntimeScript, marker) {
 			t.Fatalf("Windows screenshot contract missing %q", marker)
@@ -357,8 +644,8 @@ func TestWindowsRuntimeScreenshotCaptureContract(t *testing.T) {
 	if !strings.Contains(windowsRuntimeScript, "Build-Snapshot $operation.app (Resolve-TextLimit $operation.text_limit) ([int]$operation.max_tree_nodes) ([int]$operation.max_tree_depth) ([bool]$operation.include_image)") {
 		t.Fatal("get_app_state include_image was not forwarded to Build-Snapshot")
 	}
-	if !strings.Contains(windowsRuntimeScript, "Build-Snapshot $operation.app $null $AccessibilityTreeMaxNodeCount $AccessibilityTreeMaxDepth $true") {
-		t.Fatal("action refreshes must retain screenshots")
+	if !strings.Contains(windowsRuntimeScript, "Build-SnapshotForProcess $process $operation.app $null $AccessibilityTreeMaxNodeCount $AccessibilityTreeMaxDepth $true") {
+		t.Fatal("action refreshes must retain the validated process and screenshots")
 	}
 }
 func TestWindowsRuntimeTextLimitSupportsMaxMode(t *testing.T) {
