@@ -145,6 +145,94 @@ func TestWindowsRuntimeBindsActionsToSnapshotIdentity(t *testing.T) {
 	}
 }
 
+func TestWindowsRuntimeRequiresExactValidElementIdentity(t *testing.T) {
+	for _, marker := range []string{
+		"function Test-IntegerRuntimeIdValue($value)",
+		"$isNumeric = $value -is [System.SByte]",
+		"$number -eq [decimal]::Truncate($number)",
+		"$number -ge [decimal][int32]::MinValue",
+		"$number -le [decimal][int32]::MaxValue",
+		"function Test-NonEmptyRuntimeId($runtimeId)",
+		"if ($values.Count -eq 0)",
+		"foreach ($value in $values)",
+		"if (-not (Test-IntegerRuntimeIdValue $value))",
+		"return $true",
+		"function Same-RuntimeId($left, $right)",
+		"if (-not (Test-NonEmptyRuntimeId $left) -or -not (Test-NonEmptyRuntimeId $right))",
+		"[int64]$leftValues[$i] -ne [int64]$rightValues[$i]",
+		"function Find-Element([IntPtr]$rootHwnd, $record)",
+		"[Windows.Automation.AutomationElement]::FromHandle($rootHwnd)",
+		"function Resolve-SnapshotElement([IntPtr]$rootHwnd, $record)",
+		"if (-not (Test-NonEmptyRuntimeId $record.runtimeId))",
+		"$element = Find-Element $rootHwnd $record",
+		"if ($null -eq $element) {",
+		"$element = Resolve-SnapshotElement $hwnd $operation.element",
+		"if ($message -ne \"Target changed; call get_app_state again.\") {",
+	} {
+		if !strings.Contains(windowsRuntimeScript, marker) {
+			t.Fatalf("Windows element identity contract missing %q", marker)
+		}
+	}
+	if strings.Contains(windowsRuntimeScript, "$sameAutomationId") ||
+		strings.Contains(windowsRuntimeScript, "$sameName") ||
+		strings.Contains(windowsRuntimeScript, "$sameType") {
+		t.Fatal("Windows element resolution must not use presentation metadata fallback")
+	}
+	if strings.Contains(windowsRuntimeScript, "$element = Find-Element $process $operation.element") {
+		t.Fatal("element actions must pass through the shared snapshot element resolver")
+	}
+	if strings.Contains(windowsRuntimeScript, "$element = Resolve-SnapshotElement $process $operation.element") {
+		t.Fatal("element actions must resolve from the snapshot-bound HWND, not a mutable process main window")
+	}
+
+	switchStart := strings.Index(windowsRuntimeScript, "        switch ($operation.tool) {")
+	elementInitStart := strings.Index(windowsRuntimeScript, "        $element = $null")
+	resolverStart := strings.Index(windowsRuntimeScript, "        $element = Resolve-SnapshotElement $hwnd $operation.element")
+	if elementInitStart < 0 || resolverStart < 0 || switchStart < 0 || elementInitStart > resolverStart || resolverStart > switchStart {
+		t.Fatal("snapshot element resolution must be initialized and conditional before action dispatch")
+	}
+	preDispatch := windowsRuntimeScript[elementInitStart:switchStart]
+	if !strings.Contains(preDispatch, "if ($null -ne $operation.element) {") {
+		t.Fatal("snapshot element resolution must be conditional so coordinate-only operations bypass the child-element gate")
+	}
+}
+
+func TestWindowsRuntimeRejectsStaleElementsBeforeDelivery(t *testing.T) {
+	resolverStart := strings.Index(windowsRuntimeScript, "function Resolve-SnapshotElement([IntPtr]$rootHwnd, $record)")
+	dispatchStart := strings.Index(windowsRuntimeScript, "        $element = Resolve-SnapshotElement $hwnd $operation.element")
+	if resolverStart < 0 || dispatchStart < 0 {
+		t.Fatal("shared snapshot element resolver is missing")
+	}
+	resolverEnd := strings.Index(windowsRuntimeScript[resolverStart:], "function Get-CurrentPatternOrNull")
+	if resolverEnd < 0 {
+		t.Fatal("could not bound shared snapshot element resolver")
+	}
+	resolver := windowsRuntimeScript[resolverStart : resolverStart+resolverEnd]
+	if strings.Contains(resolver, "Get-MainElement") {
+		t.Fatal("snapshot element resolver must not re-root through a mutable process main window")
+	}
+	if strings.Contains(resolver, "Invoke-") || strings.Contains(resolver, "PostMessage") || strings.Contains(resolver, "SendInput") || strings.Contains(resolver, "Get-ScreenPoint") {
+		t.Fatal("snapshot element resolver must not deliver input")
+	}
+
+	switchEndOffset := strings.Index(windowsRuntimeScript[dispatchStart:], "        Start-Sleep -Milliseconds 120")
+	if switchEndOffset < 0 {
+		t.Fatal("could not bound action dispatch")
+	}
+	dispatch := windowsRuntimeScript[dispatchStart : dispatchStart+switchEndOffset]
+	for _, marker := range []string{
+		"\"click\" {",
+		"\"perform_secondary_action\" {",
+		"\"scroll\" {",
+		"\"set_value\" {",
+		"Get-ValidatedScrollFallbackPoint $operation.element $windowBounds",
+	} {
+		if !strings.Contains(dispatch, marker) {
+			t.Fatalf("element action dispatch missing %q", marker)
+		}
+	}
+}
+
 func TestWindowsRuntimeGuardsCoordinateAndAppScopedMessagePaths(t *testing.T) {
 	for _, marker := range []string{
 		"function Assert-SnapshotCoordinateBounds",

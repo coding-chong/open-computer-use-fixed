@@ -21,7 +21,8 @@ For deterministic smoke runs, both scripts accept `-InstanceName`, `-ReadyPath`,
 - UIA text fallback and `set_value`;
 - printable and navigation keyboard input;
 - pointer drag on a `Slider`;
-- scrolling; and
+- scrolling;
+- a controlled element-identity replacement surface with duplicate presentation metadata among settable text controls; and
 - screenshot capture.
 
 `app_post` intentionally has no native child HWND on this WPF target. It should return the explicit capability error rather than moving the real pointer.
@@ -38,7 +39,7 @@ Run the source-owned runner with PowerShell 7 from `apps/OpenComputerUseWindows`
 pwsh.exe -NoProfile -ExecutionPolicy Bypass -File .\fixtures\run-interactive-smoke.ps1
 ```
 
-It launches two WPF instances and one WinForms instance, verifies identity-pinned A behavior, unchanged B state, mismatched identity, moved-window stale bounds, unauthorized global/keyboard rejection, WPF app-post capability handling, native `BM_CLICK`, and outside-window app-post rejection, then terminates all fixtures. Add `-KeepArtifacts` only when diagnosing a failed run.
+It launches two WPF instances and one WinForms instance, verifies identity-pinned A behavior, missing/empty/blank/null-member/non-numeric/fractional/both-sided-out-of-range element runtime IDs, and a synchronized same-metadata replacement surface for settable text controls. The runner proves the original runtime ID differs from both current duplicate settable-text records, writes each fresh duplicate independently, then verifies a stale old record is rejected before accessibility/app-post/global/auto click, secondary action, scroll, or `set_value` can mutate either replacement. It also checks unchanged B state, mismatched identity, moved-window stale bounds, unauthorized global/keyboard rejection, WPF app-post capability handling, native `BM_CLICK`, and outside-window app-post rejection, then terminates all fixtures. Add `-KeepArtifacts` only when diagnosing a failed run.
 
 The Go integration test `TestWindowsFixtureIdentityAndBoundsSmoke` remains an additional request-propagation check and is explicitly opt-in with `$env:OPEN_COMPUTER_USE_RUN_WINDOWS_FIXTURE_SMOKE = '1'`.
 

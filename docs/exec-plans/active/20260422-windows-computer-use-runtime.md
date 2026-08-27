@@ -2,14 +2,14 @@
 
 ## 目标
 
-把当前只覆盖 macOS Accessibility 的 `open-computer-use` 扩展到 Windows，优先让同一组 9 个 Computer Use tools 能通过独立 `.exe` 跑起来，并保留后续补强路径。
+把当前只覆盖 macOS Accessibility 的 `open-computer-use` 扩展到 Windows，优先让同一组 10 个 Computer Use tools 能通过独立 `.exe` 跑起来，并保留后续补强路径。
 
 ## 范围
 
 - 包含：
   - Windows 独立 runtime，不耦合 Swift `.app`。
   - Go CLI / MCP / `call --calls` 入口。
-  - `list_apps`、`get_app_state`、`click`、`perform_secondary_action`、`scroll`、`drag`、`type_text`、`press_key`、`set_value` 的功能性实现。
+  - `list_apps`、`get_app_state`、`save_screenshot`、`click`、`perform_secondary_action`、`scroll`、`drag`、`type_text`、`press_key`、`set_value` 的功能性实现。
   - Windows `.exe` 构建脚本和基础 Go 单测。
   - 架构文档、README 和 history。
 - 不包含：
@@ -46,7 +46,7 @@
 
 ## 里程碑
 
-1. 完成 Windows Go runtime 骨架和 9-tool 功能性实现。
+1. 完成 Windows Go runtime 骨架和 10-tool 功能性实现。
 2. 完成 `.exe` 构建脚本、Go 单测、MCP/tools list 和 SSH 基础验证。
 3. 补交互式桌面 smoke、Windows fixture、installer/signing 和更原生 UIA 实现。
 
@@ -67,7 +67,7 @@
 ## 进度记录
 
 - [x] 新增 `apps/OpenComputerUseWindows`，用 Go 实现 CLI、MCP、tool schema、`call --calls` 和 snapshot cache。
-- [x] 嵌入 Windows PowerShell UIA bridge，实现 9 个 tools 的功能性路径。
+- [x] 嵌入 Windows PowerShell UIA bridge，实现 10 个 tools 的功能性路径。
 - [x] 新增 Windows arm64/amd64 `.exe` 构建脚本。
 - [x] 新增 Go 单测，并接入仓库基础 CI。
 - [x] 通过 SSH 到 Windows 验证 `.exe --version`、`call list_apps` 和 MCP initialize/tools list。
@@ -77,12 +77,12 @@
 - [x] 收紧 Windows 后台运行默认策略：找不到 app 时不再自动启动，`SetFocus` 默认禁用，只能通过环境变量显式开启。
 - [x] 将 `type_text` 默认路径从 UIA `ValuePattern.SetValue` 改为 child HWND `EM_SETSEL` / `EM_REPLACESEL` 优先；可能把 app 带到前台的 UIA text fallback 改成环境变量显式开启。
 - [x] 通过交互式 Windows scheduled task 验证新 `type_text` 路径：`get_app_state -> type_text -> get_app_state` 三步均 `isError=false`，Notepad 文本包含 `bgmsg-*` marker，前台窗口调用前后均为 Codex。
-- [x] 增加 `apps/OpenComputerUseWindows/fixtures/` 中可观察的 WPF 和 WinForms 夹具，覆盖 9-tool 交互路径及 native HWND app-post 计数器。
+- [x] 增加 `apps/OpenComputerUseWindows/fixtures/` 中可观察的 WPF 和 WinForms 夹具，覆盖 9 个交互 tools 及 native HWND app-post 计数器；Windows 专用的 `save_screenshot` 另由 source/MCP 验证覆盖。
 - [x] 对 explicit opt-in `global` click、drag 和授权 `press_key` 添加 DPI-aware `SendInput` 路径；pointer 验证请求坐标处的窗口归属，keyboard 验证 foreground ownership，并以明确错误保留 foreground/UIPI 限制。
 - [x] 修正 `press_key` 未授权分支：没有 `OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT=1` 时在发送任何键消息前 fail closed；补充 Go 嵌入式 runtime 回归断言。
 - [x] 收紧 `app_post`：WPF/no-child-HWND 返回 capability error；native button 使用 `BM_CLICK`，不静默变为 global input。
 - [ ] 在交互式 Windows 桌面 session 补 Notepad / Edge 等真实 UI action smoke。
-- [x] 增加 Windows fixture；[x] 增加 opt-in WPF identity/bounds smoke test（双实例、snapshot identity、窗口移动后的 stale bounds）；[x] 增加 PowerShell 7 deterministic safety runner（WPF/WinForms、授权负例、strict app_post）；[ ] 扩展 runner 覆盖完整 action matrix。
+- [x] 增加 Windows fixture；[x] 增加 opt-in WPF identity/bounds smoke test（双实例、snapshot identity、窗口移动后的 stale bounds）；[x] 增加 PowerShell 7 deterministic safety runner（WPF/WinForms、授权负例、strict app_post、缺失/空/空白/null member/字符串/分数/越界 runtime ID、从 snapshot HWND 解析的 exact child identity、同元数据元素 replacement/duplicate，以及每个 stale element-targeted action 的 fail-closed 回归）；[ ] 扩展 runner 覆盖完整 action matrix。
 - [ ] 评估用 `PrintWindow` / Windows Graphics Capture 补一条不依赖窗口可见性的 background screenshot 路径。
 - [ ] 为必须依赖前台输入的 app/toolkit 场景补更明确的 capability/error，避免静默退到抢焦点行为。
 - [x] 将 Windows artifact 接入 npm release packaging，作为既有 npm root/alias packages 的 bundled artifacts 分发。
@@ -105,3 +105,4 @@
 - 2026-08-23：`app_post` 保持非全局语义。native WinForms button 用 `BM_CLICK` 触发控制自身的 click 合约，其他 native HWND 保留消息坐标路径；WPF/no-child-HWND 返回明确 capability error。
 - 2026-08-23：新增可观察的 WPF/WinForms fixtures，并用计数器和值验证 UIA、native message 和 interactive input 路径。
 - 2026-08-25：审查发现 `press_key` 在前台授权缺失时仍会走未保护的 `PostMessage` fallback；删除该路径并在未授权时 fail closed。后续审查还收紧了非 global drag fallback：验证 HWND 所有权和每次 `PostMessage` 投递结果。最终通过注册的 `go run . mcp` source launcher 完成 WPF 9-tool matrix、native `BM_CLICK`、global click 和 thumb-centered drag；新 unsigned PE 在首次启动时被主机移除，待签名 release artifact 替代此本地开发 launcher。
+- 2026-08-27：元素索引动作改为只接受非空、数值类型有效、可表示为 signed 32-bit UIA component 的 exact `runtimeId`；空白、字符串、分数、null member 和越界值都拒绝。解析以 snapshot-bound HWND 建立当前 UIA 根；移除名称/automation-ID/类型的弱匹配，并在 UIA、frame 或输入投递前统一 fail closed。WPF/WinForms runner 新增这些 malformed-ID cases、replacement 后 old/new runtime-ID distinctness、fresh duplicate 独立寻址，以及 stale `click`、secondary、scroll、`set_value` 的实际回归。runtime-ID reuse 仍是 provider 级后续风险，不能以 metadata fallback 规避。

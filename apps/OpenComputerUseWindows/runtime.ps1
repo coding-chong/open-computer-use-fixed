@@ -1253,12 +1253,61 @@ function List-Apps {
     return ($lines -join "`n")
 }
 
-function Same-RuntimeId($left, $right) {
-    if ($null -eq $left -or $null -eq $right -or $left.Count -ne $right.Count) {
+function Test-IntegerRuntimeIdValue($value) {
+    if ($null -eq $value) {
         return $false
     }
-    for ($i = 0; $i -lt $left.Count; $i++) {
-        if ([int]$left[$i] -ne [int]$right[$i]) {
+    $isNumeric = $value -is [System.SByte] -or
+        $value -is [System.Byte] -or
+        $value -is [System.Int16] -or
+        $value -is [System.UInt16] -or
+        $value -is [System.Int32] -or
+        $value -is [System.UInt32] -or
+        $value -is [System.Int64] -or
+        $value -is [System.UInt64] -or
+        $value -is [System.Single] -or
+        $value -is [System.Double] -or
+        $value -is [System.Decimal]
+    if (-not $isNumeric) {
+        return $false
+    }
+    try {
+        $number = [decimal]$value
+        return $number -eq [decimal]::Truncate($number) -and
+            $number -ge [decimal][int32]::MinValue -and
+            $number -le [decimal][int32]::MaxValue
+    } catch {
+        return $false
+    }
+}
+
+function Test-NonEmptyRuntimeId($runtimeId) {
+    if ($null -eq $runtimeId) {
+        return $false
+    }
+    $values = @($runtimeId)
+    if ($values.Count -eq 0) {
+        return $false
+    }
+    foreach ($value in $values) {
+        if (-not (Test-IntegerRuntimeIdValue $value)) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Same-RuntimeId($left, $right) {
+    if (-not (Test-NonEmptyRuntimeId $left) -or -not (Test-NonEmptyRuntimeId $right)) {
+        return $false
+    }
+    $leftValues = @($left)
+    $rightValues = @($right)
+    if ($leftValues.Count -ne $rightValues.Count) {
+        return $false
+    }
+    for ($i = 0; $i -lt $leftValues.Count; $i++) {
+        if ([int64]$leftValues[$i] -ne [int64]$rightValues[$i]) {
             return $false
         }
     }
@@ -1278,11 +1327,18 @@ function Get-AllElements($root) {
     return $items.ToArray()
 }
 
-function Find-Element($process, $record) {
-    if ($null -eq $record) {
+function Find-Element([IntPtr]$rootHwnd, $record) {
+    if ($rootHwnd -eq [IntPtr]::Zero -or -not [OCUWin32]::IsWindow($rootHwnd) -or $null -eq $record -or -not (Test-NonEmptyRuntimeId $record.runtimeId)) {
         return $null
     }
-    $root = Get-MainElement $process
+    try {
+        $root = [Windows.Automation.AutomationElement]::FromHandle($rootHwnd)
+    } catch {
+        return $null
+    }
+    if ($null -eq $root) {
+        return $null
+    }
     foreach ($element in (Get-AllElements $root)) {
         try {
             if (Same-RuntimeId @($element.GetRuntimeId()) @($record.runtimeId)) {
@@ -1291,18 +1347,25 @@ function Find-Element($process, $record) {
         } catch {
         }
     }
-    foreach ($element in (Get-AllElements $root)) {
-        try {
-            $sameAutomationId = -not [string]::IsNullOrWhiteSpace($record.automationId) -and $element.Current.AutomationId -eq $record.automationId
-            $sameName = -not [string]::IsNullOrWhiteSpace($record.name) -and $element.Current.Name -eq $record.name
-            $sameType = $element.Current.ControlType.ProgrammaticName -eq $record.controlType
-            if (($sameAutomationId -or $sameName) -and $sameType) {
-                return $element
-            }
-        } catch {
-        }
-    }
     return $null
+}
+
+function Resolve-SnapshotElement([IntPtr]$rootHwnd, $record) {
+    if ($null -eq $record) {
+        return $null
+    }
+    if (-not (Test-NonEmptyRuntimeId $record.runtimeId)) {
+        Throw-TargetChanged
+    }
+    try {
+        $element = Find-Element $rootHwnd $record
+    } catch {
+        Throw-TargetChanged
+    }
+    if ($null -eq $element) {
+        Throw-TargetChanged
+    }
+    return $element
 }
 
 function Get-CurrentPatternOrNull($element, $pattern) {
@@ -1556,7 +1619,10 @@ try {
         $process = $target.process
         $hwnd = $target.hwnd
         $windowBounds = $operation.windowBounds
-        $element = Find-Element $process $operation.element
+        $element = $null
+        if ($null -ne $operation.element) {
+            $element = Resolve-SnapshotElement $hwnd $operation.element
+        }
 
         switch ($operation.tool) {
             "click" {
@@ -1677,9 +1743,12 @@ try {
     }
 } catch {
     $message = $PSItem.Exception.Message
-    $stackTrace = $PSItem.ScriptStackTrace
-    if (-not [string]::IsNullOrWhiteSpace($stackTrace)) {
-        $message = "$message at $stackTrace"
+    # Keep the safety boundary actionable and bounded; do not expose internal stack details.
+    if ($message -ne "Target changed; call get_app_state again.") {
+        $stackTrace = $PSItem.ScriptStackTrace
+        if (-not [string]::IsNullOrWhiteSpace($stackTrace)) {
+            $message = "$message at $stackTrace"
+        }
     }
     $response = [pscustomobject]@{ ok = $false; error = $message }
 }

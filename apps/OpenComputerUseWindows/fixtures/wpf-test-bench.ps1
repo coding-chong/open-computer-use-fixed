@@ -75,6 +75,11 @@ Add-Type -AssemblyName WindowsBase
         <TextBlock x:Name="clickStatus" Text="auto=0; accessibility=0; appPost=0; secondary=0" AutomationProperties.Name="Click status" />
       </Border>
     </StackPanel>
+    <StackPanel Grid.Row="4" Margin="0,8,0,0" Orientation="Horizontal">
+      <Button x:Name="replaceIdentityButton" Height="30" Width="220" Content="Replace identity target" AutomationProperties.Name="Replace identity target" />
+      <StackPanel x:Name="identityTargetHost" Margin="8,0,0,0" Orientation="Horizontal" />
+      <TextBlock x:Name="identityStatus" Margin="8,7,0,0" Text="identityGeneration=0" AutomationProperties.Name="Identity status" />
+    </StackPanel>
     <Grid Grid.Row="5" Margin="0,20,0,0">
       <Grid.ColumnDefinitions>
         <ColumnDefinition Width="*" />
@@ -144,6 +149,9 @@ $dragStatus = $window.FindName('dragStatus')
 $scrollBox = $window.FindName('scrollBox')
 $scrollText = $window.FindName('scrollText')
 $scrollStatus = $window.FindName('scrollStatus')
+$replaceIdentityButton = $window.FindName('replaceIdentityButton')
+$identityTargetHost = $window.FindName('identityTargetHost')
+$identityStatus = $window.FindName('identityStatus')
 
 $script:autoCount = 0
 $script:accessibilityCount = 0
@@ -151,6 +159,40 @@ $script:appPostCount = 0
 $script:secondaryCount = 0
 $script:keyEvents = 0
 $script:scrollEvents = 0
+$script:identityGeneration = 0
+$script:identityReplacementCount = 0
+$script:identityTarget = $null
+$script:identityDuplicate = $null
+
+function New-IdentityTarget([string]$initialValue) {
+    $box = New-Object System.Windows.Controls.TextBox
+    $box.Width = 220
+    $box.Height = 30
+    $box.Margin = New-Object System.Windows.Thickness(0,0,8,0)
+    $box.Text = $initialValue
+    [System.Windows.Automation.AutomationProperties]::SetName($box, 'Identity replacement target')
+    [System.Windows.Automation.AutomationProperties]::SetAutomationId($box, 'identityTarget')
+    $box.Add_TextChanged({ Write-FixtureState })
+    return $box
+}
+
+function Install-IdentityTargets([bool]$includeDuplicate) {
+    $identityTargetHost.Children.Clear()
+    $primary = New-IdentityTarget ('identity-primary-' + $script:identityGeneration)
+    [void]$identityTargetHost.Children.Add($primary)
+    $script:identityTarget = $primary
+    $script:identityDuplicate = $null
+    if ($includeDuplicate) {
+        $duplicate = New-IdentityTarget ('identity-duplicate-' + $script:identityGeneration)
+        [void]$identityTargetHost.Children.Add($duplicate)
+        $script:identityDuplicate = $duplicate
+    }
+}
+
+function Update-IdentityStatus {
+    $identityStatus.Text = 'identityGeneration=' + $script:identityGeneration + '; replacements=' + $script:identityReplacementCount
+    [System.Windows.Automation.AutomationProperties]::SetName($identityStatus, $identityStatus.Text)
+}
 
 function Get-FixtureState {
     $process = Get-Process -Id $PID -ErrorAction SilentlyContinue
@@ -181,6 +223,10 @@ function Get-FixtureState {
         eventCount = [int]$script:keyEvents
         dragValue = [int]$slider.Value
         scrollEvents = [int]$script:scrollEvents
+        identityGeneration = [int]$script:identityGeneration
+        identityReplacementCount = [int]$script:identityReplacementCount
+        identityPrimaryValue = if ($null -ne $script:identityTarget) { [string]$script:identityTarget.Text } else { '' }
+        identityDuplicateValue = if ($null -ne $script:identityDuplicate) { [string]$script:identityDuplicate.Text } else { '' }
     }
 }
 
@@ -237,6 +283,13 @@ $scrollBox.Add_ScrollChanged({
         Write-FixtureState
     }
 })
+$replaceIdentityButton.Add_Click({
+    $script:identityGeneration += 1
+    $script:identityReplacementCount += 1
+    Install-IdentityTargets $true
+    Update-IdentityStatus
+    Write-FixtureState
+})
 
 $rows = New-Object System.Collections.Generic.List[string]
 foreach ($row in 1..80) {
@@ -249,6 +302,8 @@ Set-Status $setStatus 'setValue=""'
 Set-Status $keyStatus 'lastKey=""; eventCount=0'
 Set-Status $dragStatus 'dragValue=10'
 Set-Status $scrollStatus 'scrollEvents=0'
+Install-IdentityTargets $false
+Update-IdentityStatus
 
 $window.Add_ContentRendered({
     Write-FixtureState
