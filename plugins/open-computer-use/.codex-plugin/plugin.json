@@ -20,7 +20,7 @@
   "interface": {
     "displayName": "Open Computer Use",
     "shortDescription": "Control desktop apps from Codex with the open local server",
-    "longDescription": "Open Computer Use packages this repository's open-source desktop automation server as a Codex plugin. It exposes the same nine desktop-control MCP tools through a local macOS app bundle or Linux / Windows native binary, with semantic accessibility paths preferred before fallback input.",
+    "longDescription": "Open Computer Use packages this repository's open-source desktop automation server as a Codex plugin. It exposes the same nine desktop-control MCP tools through a local macOS app bundle or Linux native binary, and adds a Windows save_screenshot export tool to the Windows native runtime, with semantic accessibility paths preferred before fallback input.",
     "developerName": "Leo",
     "category": "Productivity",
     "capabilities": [
@@ -34,7 +34,7 @@
     "defaultPrompt": [
       "Inspect the current UI state of this desktop app without stealing focus when possible",
       "Open a new local document with keyboard shortcuts first, then type content without moving my real pointer unless required",
-      "Drive the fixture app and verify the nine computer-use tools still behave correctly"
+      "Drive the fixture app and verify the available Computer Use tools still behave correctly"
     ],
     "brandColor": "#0E7490",
     "composerIcon": "./assets/open-computer-use-small.svg",

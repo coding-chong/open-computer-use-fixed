@@ -32,7 +32,7 @@
   - `scripts/build-open-computer-use-windows.sh`
 - 已知约束：
   - 当前 npm registry 上的 `open-computer-use@0.1.33` 仍声明 `os=["darwin"]`，Linux/Windows 不会正常安装。
-  - Linux/Windows runtime 是实验性 first version，但已经暴露同一组 9 个 MCP tools。
+  - Linux runtime 是实验性 first version，暴露公开的 9 个 MCP tools；Windows runtime 另提供 `save_screenshot`，当前暴露 10 个 MCP tools。
   - root package 需要保持 `open-computer-use`、`open-computer-use-mcp`、`open-codex-computer-use-mcp` 三个历史入口。
 
 ## 风险
