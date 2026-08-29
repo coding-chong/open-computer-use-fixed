@@ -61,6 +61,13 @@ func TestWindowsGlobalClickRequiresSnapshotBeforeRuntime(t *testing.T) {
 	}
 }
 
+func TestWindowsTypeTextRequiresSnapshotBeforeRuntime(t *testing.T) {
+	result := newService().typeText("Notepad", "hello")
+	if !result.IsError || result.Content[0].Text != "No app state is available for Notepad. Run get_app_state before action tools." {
+		t.Fatalf("type_text result = %#v", result)
+	}
+}
+
 func TestSnapshotIdentityIsMarshaledIntoActionRequests(t *testing.T) {
 	snapshot := &appSnapshot{
 		App: appDescriptor{
@@ -678,6 +685,125 @@ func TestCLIHelpMentionsWindowsRuntime(t *testing.T) {
 	}
 }
 
+func TestWindowsTypeTextSchemaRemainsFocusOnly(t *testing.T) {
+	tool := findToolDefinition(t, "type_text")
+	properties, ok := tool.InputSchema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("type_text properties = %#v", tool.InputSchema["properties"])
+	}
+	if len(properties) != 2 {
+		t.Fatalf("type_text must retain exactly app and text properties, got %#v", properties)
+	}
+	for _, key := range []string{"app", "text"} {
+		if _, ok := properties[key]; !ok {
+			t.Fatalf("type_text schema is missing %q: %#v", key, properties)
+		}
+	}
+	if _, ok := properties["element_index"]; ok {
+		t.Fatal("type_text must not add an element_index field under the selected focus-only contract")
+	}
+	required, ok := tool.InputSchema["required"].([]string)
+	if !ok || strings.Join(required, ",") != "app,text" {
+		t.Fatalf("type_text required fields = %#v, want [app text]", tool.InputSchema["required"])
+	}
+	for _, marker := range []string{
+		"current focused writable text control",
+		"Click/select the field first",
+		"never chooses a substitute control",
+		"set_value",
+	} {
+		if !strings.Contains(tool.Description, marker) {
+			t.Fatalf("type_text description must document %q: %s", marker, tool.Description)
+		}
+	}
+}
+
+func TestWindowsTypeTextUsesOnlyValidatedFocusedTarget(t *testing.T) {
+	for _, marker := range []string{
+		"$TypeTextTargetError =",
+		"$TypeTextFallbackError =",
+		"$TypeTextDeliveryError =",
+		"function Test-SameAutomationElement",
+		"compare only validated runtime IDs",
+		"return (Same-RuntimeId $leftRuntimeId $rightRuntimeId)",
+		"function Test-AutomationElementDescendantOf",
+		"function Test-FocusedTextElement",
+		"function Test-TextEntryControlType",
+		"Test-HwndOwnedByProcess $nativeHwnd $process",
+		"Test-HwndDescendantOf $rootHwnd $nativeHwnd",
+		"function Get-ValidatedFocusedTextTarget",
+		"[Windows.Automation.AutomationElement]::FocusedElement",
+		"function Assert-FocusedTextTarget",
+		"Assert-FocusedTextTarget $process $rootHwnd $element $hwnd",
+		"Invoke-FocusedValuePatternText $process $rootHwnd $text $target.element",
+		"OPEN_COMPUTER_USE_WINDOWS_ALLOW_UIA_TEXT_FALLBACK",
+		"type_text requires a focused writable text control",
+		"type_text could not write to the focused text control",
+	} {
+		if !strings.Contains(windowsRuntimeScript, marker) {
+			t.Fatalf("Windows type_text focus contract missing %q", marker)
+		}
+	}
+
+	typeStart := strings.Index(windowsRuntimeScript, "$TypeTextTargetError")
+	dispatchStart := strings.Index(windowsRuntimeScript, "            \"type_text\" {")
+	focusStart := strings.Index(windowsRuntimeScript, "function Test-SameAutomationElement")
+	focusEnd := strings.Index(windowsRuntimeScript, "function Resolve-AppPostTargetHandle")
+	deliveryStart := strings.Index(windowsRuntimeScript, "function Assert-FocusedTextTarget")
+	deliveryEnd := strings.Index(windowsRuntimeScript, "# Read the operation file as UTF-8 explicitly.")
+	if typeStart < 0 || focusStart < 0 || focusEnd < 0 || deliveryStart < 0 || deliveryEnd < 0 || dispatchStart < 0 || typeStart >= focusStart || focusStart >= focusEnd || deliveryStart >= deliveryEnd || deliveryEnd >= dispatchStart {
+		t.Fatal("could not bound the Windows type_text implementation")
+	}
+	typeImplementation := windowsRuntimeScript[focusStart:focusEnd] + windowsRuntimeScript[deliveryStart:deliveryEnd]
+	for _, forbidden := range []string{
+		"Get-AllElements",
+		"Get-MainElement",
+		"Find-TextEntryElement",
+		"Find-TextEntryWindowHandle",
+		"Test-TextWindowHandleCandidate",
+		"Send-Text $process",
+		"WM_CHAR",
+		"SendInputRecords",
+		"SetForegroundWindow",
+		"SetFocus()",
+		"Clipboard",
+	} {
+		if strings.Contains(typeImplementation, forbidden) {
+			t.Fatalf("type_text implementation must not use substitute or implicit-input path %q", forbidden)
+		}
+	}
+
+	if strings.Count(typeImplementation, "[Windows.Automation.AutomationElement]::FocusedElement") < 2 {
+		t.Fatal("type_text must read the focused element again immediately before delivery")
+	}
+	if !strings.Contains(typeImplementation, "ControlType.Edit") || !strings.Contains(typeImplementation, "ControlType.Document") {
+		t.Fatal("type_text must restrict implicit targets to writable text control types")
+	}
+
+	branchEndOffset := strings.Index(windowsRuntimeScript[dispatchStart:], "            \"press_key\" {")
+	if branchEndOffset < 0 {
+		t.Fatal("could not bound the type_text dispatch branch")
+	}
+	branch := windowsRuntimeScript[dispatchStart : dispatchStart+branchEndOffset]
+	if !strings.Contains(branch, "Invoke-TypeText $process $hwnd $operation.text") {
+		t.Fatal("type_text dispatch must pass the snapshot-bound window handle to the focused-target implementation")
+	}
+	if strings.Contains(branch, "Send-Text") || strings.Contains(branch, "$operation.element") {
+		t.Fatal("type_text dispatch must not fall back to top-level text messages or an element record")
+	}
+
+	catchStart := strings.Index(windowsRuntimeScript, "    $message = $PSItem.Exception.Message")
+	if catchStart < 0 {
+		t.Fatal("runtime error boundary is missing")
+	}
+	catchBlock := windowsRuntimeScript[catchStart:]
+	for _, marker := range []string{"$message -ne $TypeTextTargetError", "$message -ne $TypeTextFallbackError", "$message -ne $TypeTextDeliveryError"} {
+		if !strings.Contains(catchBlock, marker) {
+			t.Fatalf("bounded type_text error must not receive a script stack trace: %q", marker)
+		}
+	}
+}
+
 func TestWindowsRuntimeForegroundActionsRequireOptIn(t *testing.T) {
 	for _, marker := range []string{
 		"OPEN_COMPUTER_USE_WINDOWS_ALLOW_APP_LAUNCH",
@@ -710,6 +836,16 @@ func TestWindowsRuntimeForegroundActionsRequireOptIn(t *testing.T) {
 	}
 	if !strings.Contains(serverInstructions, "`press_key` is rejected unless the foreground-input flag is set") {
 		t.Fatal("MCP instructions must document keyboard input authorization")
+	}
+	for _, marker := range []string{
+		"Windows `type_text` requires the current focused control",
+		"click/select the field first",
+		"never searches the current UIA tree for a substitute control",
+		"top-level keyboard messages",
+	} {
+		if !strings.Contains(serverInstructions, marker) {
+			t.Fatalf("MCP instructions must document the type_text focus contract %q", marker)
+		}
 	}
 }
 

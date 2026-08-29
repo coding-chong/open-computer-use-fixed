@@ -38,6 +38,7 @@ It supports the same core tool surface across macOS, Linux, and Windows:
 - Prefer semantic actions and `set_value` for editable controls. Use coordinate `click`, `scroll`, and `drag` only when the element tree does not expose a safer target.
 - On macOS, do not enable `OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1` unless the user explicitly requested `click_method: "global"` or other diagnostic behavior that may move the real pointer.
 - On Windows and Linux, confirm the command is running inside the logged-in desktop session before assuming GUI automation is available.
+- On Windows, `type_text` writes only to the current focused writable text control after process/window ownership validation. Click or select the field first; it never scans the current UIA tree for a substitute, establishes focus implicitly, or falls back to top-level keyboard messages. Use `set_value` with `element_index` when exact element-indexed assignment is required.
 
 ## Common CLI Actions
 
@@ -54,6 +55,8 @@ open-computer-use call get_app_state --args '{"app":"Google Chrome","max_tree_no
 open-computer-use call click --args '{"app":"TextEdit","element_index":"0"}'
 open-computer-use call type_text --args '{"app":"TextEdit","text":"Hello from Open Computer Use"}'
 ```
+
+On Windows, the `type_text` example assumes the intended text field was focused or selected immediately beforehand; use `set_value` with `element_index` for exact element-indexed assignment.
 
 For a short sequence that reuses state in one process:
 

@@ -165,7 +165,6 @@ $WM_MOUSEWHEEL = 0x020A
 $WM_MOUSEHWHEEL = 0x020E
 $WM_KEYDOWN = 0x0100
 $WM_KEYUP = 0x0101
-$WM_CHAR = 0x0102
 $EM_SETSEL = 0x00B1
 $EM_REPLACESEL = 0x00C2
 $BM_CLICK = 0x00F5
@@ -754,18 +753,7 @@ function Send-Scroll($process, [IntPtr]$hwnd, [int]$screenX, [int]$screenY, [str
     }
 }
 
-function Send-Text($process, [IntPtr]$hwnd, [string]$text) {
-    Assert-AppScopedMessageTarget $process $hwnd
-    foreach ($char in $text.ToCharArray()) {
-        Assert-AppScopedMessageTarget $process $hwnd
-        if (-not [OCUWin32]::PostMessage($hwnd, $WM_CHAR, [IntPtr][int][char]$char, [IntPtr]::Zero)) {
-            throw "Windows could not queue the requested app-scoped text message."
-        }
-        Start-Sleep -Milliseconds 8
-    }
-}
-
-function Send-TextToEditHandle($process, [IntPtr]$hwnd, [string]$text, $element) {
+function Send-TextToEditHandle($process, [IntPtr]$hwnd, [string]$text, $element, [IntPtr]$rootHwnd) {
     if ($hwnd -eq [IntPtr]::Zero) {
         return $false
     }
@@ -773,6 +761,7 @@ function Send-TextToEditHandle($process, [IntPtr]$hwnd, [string]$text, $element)
         return $false
     }
 
+    [void](Assert-FocusedTextTarget $process $rootHwnd $element $hwnd)
     try {
         [void][OCUWin32]::SendMessage($hwnd, $EM_SETSEL, [IntPtr](-1), [IntPtr](-1))
         [void][OCUWin32]::SendMessage($hwnd, $EM_REPLACESEL, [IntPtr]1, $text)
@@ -780,6 +769,7 @@ function Send-TextToEditHandle($process, [IntPtr]$hwnd, [string]$text, $element)
     } catch {
     }
 
+    [void](Assert-FocusedTextTarget $process $rootHwnd $element $hwnd)
     try {
         $current = ""
         if ($null -ne $element) {
@@ -1515,38 +1505,143 @@ function Invoke-Scroll($element, [string]$direction, [double]$pages) {
     return $true
 }
 
-function Find-TextEntryElement($process) {
+# type_text has no element record; the action-time focused element is its only implicit target.
+# Keep this boundary separate from the snapshot element resolver used by set_value and other indexed actions.
+$TypeTextTargetError = 'type_text requires a focused writable text control owned by the requested app/window; click/select the field first or use set_value with element_index.'
+$TypeTextFallbackError = 'The focused text control has no usable native edit handle; UIA ValuePattern text fallback is disabled by default; set OPEN_COMPUTER_USE_WINDOWS_ALLOW_UIA_TEXT_FALLBACK=1 or use set_value with element_index.'
+$TypeTextDeliveryError = 'type_text could not write to the focused text control; click/select the field again or use set_value with element_index.'
+
+# UIA proxy equality can hide provider replacement; compare only validated runtime IDs and fail closed when IDs are unavailable.
+function Test-SameAutomationElement($left, $right) {
+    if ($null -eq $left -or $null -eq $right) {
+        return $false
+    }
     try {
-        $focused = [Windows.Automation.AutomationElement]::FocusedElement
-        if ($null -ne $focused -and $focused.Current.ProcessId -eq $process.Id) {
-            $focusedValue = Get-CurrentPatternOrNull $focused ([Windows.Automation.ValuePattern]::Pattern)
-            if ($null -ne $focusedValue -and -not $focusedValue.Current.IsReadOnly) {
-                return $focused
-            }
-        }
+        $leftRuntimeId = @($left.GetRuntimeId())
+        $rightRuntimeId = @($right.GetRuntimeId())
+        return (Same-RuntimeId $leftRuntimeId $rightRuntimeId)
+    } catch {
+        return $false
+    }
+}
+
+function Test-AutomationElementDescendantOf($root, $candidate) {
+    if ($null -eq $root -or $null -eq $candidate) {
+        return $false
+    }
+    if (Test-SameAutomationElement $root $candidate) {
+        return $true
+    }
+
+    $walkers = @()
+    try {
+        $walkers += [Windows.Automation.TreeWalker]::ControlViewWalker
+    } catch {
+    }
+    try {
+        $walkers += [Windows.Automation.TreeWalker]::RawViewWalker
     } catch {
     }
 
-    $root = Get-MainElement $process
-    foreach ($element in (Get-AllElements $root)) {
-        $valuePattern = Get-CurrentPatternOrNull $element ([Windows.Automation.ValuePattern]::Pattern)
-        if ($null -eq $valuePattern -or $valuePattern.Current.IsReadOnly) {
+    foreach ($walker in $walkers) {
+        if ($null -eq $walker) {
             continue
         }
-        $controlType = Get-ElementControlTypeName $element
-        if ($controlType -like "*Edit*" -or $controlType -like "*Document*") {
-            return $element
+        $current = $candidate
+        for ($depth = 0; $depth -lt 128; $depth++) {
+            try {
+                $parent = $walker.GetParent($current)
+            } catch {
+                break
+            }
+            if ($null -eq $parent) {
+                break
+            }
+            if (Test-SameAutomationElement $root $parent) {
+                return $true
+            }
+            $current = $parent
         }
     }
+    return $false
+}
 
-    foreach ($element in (Get-AllElements $root)) {
+function Test-TextEntryControlType($element) {
+    $controlType = Get-ElementControlTypeName $element
+    return $controlType -eq 'ControlType.Edit' -or $controlType -eq 'ControlType.Document'
+}
+
+function Test-FocusedTextElement($process, [IntPtr]$rootHwnd, $rootElement, $element) {
+    if ($null -eq $element) {
+        return $false
+    }
+    try {
+        if ([int]$element.Current.ProcessId -ne [int]$process.Id) {
+            return $false
+        }
+        if (-not $element.Current.IsEnabled) {
+            return $false
+        }
+        if (-not (Test-TextEntryControlType $element)) {
+            return $false
+        }
+
+        $nativeHwnd = Get-NativeWindowHandle $element
+        if ($nativeHwnd -ne [IntPtr]::Zero) {
+            if (-not (Test-HwndOwnedByProcess $nativeHwnd $process)) {
+                return $false
+            }
+            if (-not (Test-HwndDescendantOf $rootHwnd $nativeHwnd)) {
+                return $false
+            }
+        } elseif ($null -eq $rootElement -or -not (Test-AutomationElementDescendantOf $rootElement $element)) {
+            return $false
+        }
+
         $valuePattern = Get-CurrentPatternOrNull $element ([Windows.Automation.ValuePattern]::Pattern)
-        if ($null -ne $valuePattern -and -not $valuePattern.Current.IsReadOnly) {
-            return $element
+        if ($null -eq $valuePattern -or $valuePattern.Current.IsReadOnly) {
+            return $false
         }
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Get-ValidatedFocusedTextTarget($process, [IntPtr]$rootHwnd) {
+    $rootElement = $null
+    try {
+        if ($rootHwnd -ne [IntPtr]::Zero) {
+            $rootElement = [Windows.Automation.AutomationElement]::FromHandle($rootHwnd)
+        }
+    } catch {
+        $rootElement = $null
     }
 
-    return $null
+    $focused = $null
+    try {
+        $focused = [Windows.Automation.AutomationElement]::FocusedElement
+    } catch {
+        $focused = $null
+    }
+    if (-not (Test-FocusedTextElement $process $rootHwnd $rootElement $focused)) {
+        throw $TypeTextTargetError
+    }
+
+    $rechecked = $null
+    try {
+        $rechecked = [Windows.Automation.AutomationElement]::FocusedElement
+    } catch {
+        $rechecked = $null
+    }
+    if ($null -eq $rechecked -or -not (Test-SameAutomationElement $focused $rechecked) -or -not (Test-FocusedTextElement $process $rootHwnd $rootElement $rechecked)) {
+        throw $TypeTextTargetError
+    }
+
+    return [pscustomobject]@{
+        element = $rechecked
+        nativeWindowHandle = Get-NativeWindowHandle $rechecked
+    }
 }
 
 function Get-NativeWindowHandle($element) {
@@ -1595,70 +1690,53 @@ function Resolve-AppPostTargetHandle($process, [IntPtr]$mainHwnd, $element, [int
     return $mainHwnd
 }
 
-function Test-TextWindowHandleCandidate($process, $element) {
-    if ($null -eq $element) {
-        return $false
+function Assert-FocusedTextTarget($process, [IntPtr]$rootHwnd, $expectedElement, [IntPtr]$expectedHwnd) {
+    $target = Get-ValidatedFocusedTextTarget $process $rootHwnd
+    if ($null -ne $expectedElement -and -not (Test-SameAutomationElement $target.element $expectedElement)) {
+        throw $TypeTextTargetError
     }
-    $handle = Get-NativeWindowHandle $element
-    if ($handle -eq [IntPtr]::Zero -or $handle -eq [IntPtr]$process.MainWindowHandle) {
-        return $false
+    if ($expectedHwnd -ne [IntPtr]::Zero -and $target.nativeWindowHandle -ne $expectedHwnd) {
+        throw $TypeTextTargetError
     }
-    $controlType = Get-ElementControlTypeName $element
-    $className = Get-ElementString $element "ClassName"
-    return (
-        $controlType -like "*Edit*" -or
-        $controlType -like "*Document*" -or
-        $className -like "*Edit*" -or
-        $className -like "*Rich*" -or
-        $className -like "*Text*"
-    )
+    return $target
 }
 
-function Find-TextEntryWindowHandle($process, $preferredElement) {
-    if (Test-TextWindowHandleCandidate $process $preferredElement) {
-        return Get-NativeWindowHandle $preferredElement
+function Invoke-FocusedValuePatternText($process, [IntPtr]$rootHwnd, [string]$text, $expectedElement) {
+    $target = Assert-FocusedTextTarget $process $rootHwnd $expectedElement ([IntPtr]::Zero)
+    if (-not (Test-EnvFlagEnabled "OPEN_COMPUTER_USE_WINDOWS_ALLOW_UIA_TEXT_FALLBACK")) {
+        throw $TypeTextFallbackError
     }
 
-    $root = Get-MainElement $process
-    foreach ($element in (Get-AllElements $root)) {
-        if (-not (Test-TextWindowHandleCandidate $process $element)) {
-            continue
+    try {
+        [void](Assert-FocusedTextTarget $process $rootHwnd $target.element ([IntPtr]::Zero))
+        $valuePattern = Get-CurrentPatternOrNull $target.element ([Windows.Automation.ValuePattern]::Pattern)
+        if ($null -eq $valuePattern -or $valuePattern.Current.IsReadOnly) {
+            throw $TypeTextTargetError
         }
-        $valuePattern = Get-CurrentPatternOrNull $element ([Windows.Automation.ValuePattern]::Pattern)
-        if ($null -ne $valuePattern -and -not $valuePattern.Current.IsReadOnly) {
-            return Get-NativeWindowHandle $element
+        $current = ""
+        try {
+            $current = [string]$valuePattern.Current.Value
+        } catch {
+            throw $TypeTextDeliveryError
         }
+        $valuePattern.SetValue($current + $text)
+    } catch {
+        if ($PSItem.Exception.Message -eq $TypeTextTargetError) {
+            throw $TypeTextTargetError
+        }
+        throw $TypeTextDeliveryError
     }
-
-    foreach ($element in (Get-AllElements $root)) {
-        if (Test-TextWindowHandleCandidate $process $element) {
-            return Get-NativeWindowHandle $element
-        }
-    }
-
-    return [IntPtr]::Zero
+    return $true
 }
 
-function Invoke-TypeText($process, [string]$text) {
-    $element = Find-TextEntryElement $process
-    $targetHwnd = Find-TextEntryWindowHandle $process $element
-    if ($targetHwnd -ne [IntPtr]::Zero -and (Send-TextToEditHandle $process $targetHwnd $text $element)) {
-        return $true
-    }
-
-    if ($null -ne $element) {
-        $valuePattern = Get-CurrentPatternOrNull $element ([Windows.Automation.ValuePattern]::Pattern)
-        if ($null -ne $valuePattern -and -not $valuePattern.Current.IsReadOnly) {
-            if (-not (Test-EnvFlagEnabled "OPEN_COMPUTER_USE_WINDOWS_ALLOW_UIA_TEXT_FALLBACK")) {
-                throw "UIA ValuePattern text fallback is disabled by default because it may bring the target app to the foreground; set OPEN_COMPUTER_USE_WINDOWS_ALLOW_UIA_TEXT_FALLBACK=1 to enable it."
-            }
-            $current = ""
-            try { $current = [string]$valuePattern.Current.Value } catch {}
-            $valuePattern.SetValue($current + $text)
+function Invoke-TypeText($process, [IntPtr]$rootHwnd, [string]$text) {
+    $target = Get-ValidatedFocusedTextTarget $process $rootHwnd
+    if ($target.nativeWindowHandle -ne [IntPtr]::Zero) {
+        if (Send-TextToEditHandle $process $target.nativeWindowHandle $text $target.element $rootHwnd) {
             return $true
         }
     }
-    return $false
+    return Invoke-FocusedValuePatternText $process $rootHwnd $text $target.element
 }
 
 # Read the operation file as UTF-8 explicitly. Windows PowerShell 5.1's
@@ -1758,9 +1836,7 @@ try {
                 }
             }
             "type_text" {
-                if (-not (Invoke-TypeText $process $operation.text)) {
-                    Send-Text $process $hwnd $operation.text
-                }
+                [void](Invoke-TypeText $process $hwnd $operation.text)
             }
             "press_key" {
                 if (-not (Test-EnvFlagEnabled "OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT")) {
@@ -1787,7 +1863,10 @@ try {
 } catch {
     $message = $PSItem.Exception.Message
     # Keep the safety boundary actionable and bounded; do not expose internal stack details.
-    if ($message -ne "Target changed; call get_app_state again." -and $message -ne "Click requires an element with a valid frame or explicit finite x/y coordinates.") {
+    if ($message -ne "Target changed; call get_app_state again." -and $message -ne "Click requires an element with a valid frame or explicit finite x/y coordinates." -and
+        $message -ne $TypeTextTargetError -and
+        $message -ne $TypeTextFallbackError -and
+        $message -ne $TypeTextDeliveryError) {
         $stackTrace = $PSItem.ScriptStackTrace
         if (-not [string]::IsNullOrWhiteSpace($stackTrace)) {
             $message = "$message at $stackTrace"

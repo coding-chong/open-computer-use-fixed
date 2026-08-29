@@ -102,6 +102,7 @@ function Get-FixtureState {
         clicks = [int]$script:clickCount
         buttonDown = [int]$script:buttonDown
         buttonUp = [int]$script:buttonUp
+        typed = [string]$typeTextBox.Text
         dragValue = [int]$trackBar.Value
         dragDown = [int]$script:dragDown
         dragMove = [int]$script:dragMove
@@ -136,6 +137,18 @@ $button.Add_Click({
     Write-FixtureState
 })
 $form.Controls.AddRange(@($button, $buttonStatus))
+
+$typeTextBox = New-Object System.Windows.Forms.TextBox
+$typeTextBox.Location = New-Object System.Drawing.Point(470, 70)
+$typeTextBox.Size = New-Object System.Drawing.Size(260, 28)
+$typeTextBox.AccessibleName = 'Native type_text target'
+$typeStatus = New-StatusLabel 'typed=""' 470 105 260
+$typeStatus.AccessibleName = 'Native type_text status'
+$typeTextBox.Add_TextChanged({
+    $typeStatus.Text = 'typed=' + [char]34 + $typeTextBox.Text + [char]34
+    Write-FixtureState
+})
+$form.Controls.AddRange(@($typeTextBox, $typeStatus))
 
 $sliderLabel = New-Object System.Windows.Forms.Label
 $sliderLabel.AutoSize = $true

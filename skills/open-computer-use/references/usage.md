@@ -149,6 +149,8 @@ The macOS runtime uses Accessibility, ScreenCaptureKit, app-posted input events,
 
 The Windows runtime uses UI Automation and Win32 message fallbacks. It must run in a logged-in desktop session. A detached SSH or service context may start the CLI but fail to see top-level windows.
 
+Windows `type_text` is focus-only: click or select the intended writable text control first. At delivery time the runtime validates that the current focused UIA element belongs to the requested process and snapshot-bound window, then uses only that element; it never picks the first writable/current-tree match, implicitly focuses a control, sends global keyboard input, or falls back to a top-level HWND. Use `set_value` with `element_index` for exact element-indexed assignment. UIA `ValuePattern` text delivery remains explicitly gated by `OPEN_COMPUTER_USE_WINDOWS_ALLOW_UIA_TEXT_FALLBACK=1` when no usable child edit HWND exists.
+
 ### Linux
 
 The Linux runtime uses AT-SPI2 through the desktop session bus. It must run in a logged-in graphical session with usable accessibility services. Wayland screenshot and coordinate input support is compositor-dependent and best-effort.

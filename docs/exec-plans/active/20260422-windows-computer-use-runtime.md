@@ -82,7 +82,7 @@
 - [x] 修正 `press_key` 未授权分支：没有 `OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT=1` 时在发送任何键消息前 fail closed；补充 Go 嵌入式 runtime 回归断言。
 - [x] 收紧 `app_post`：WPF/no-child-HWND 返回 capability error；native button 使用 `BM_CLICK`，不静默变为 global input。
 - [ ] 在交互式 Windows 桌面 session 补 Notepad / Edge 等真实 UI action smoke。
-- [x] 增加 Windows fixture；[x] 增加 opt-in WPF identity/bounds smoke test（双实例、snapshot identity、窗口移动后的 stale bounds）；[x] 增加 PowerShell 7 deterministic safety runner（WPF/WinForms、授权负例、strict app_post、缺失/空/空白/null member/字符串/分数/越界 runtime ID、从 snapshot HWND 解析的 exact child identity、同元数据元素 replacement/duplicate，以及每个 stale element-targeted action 的 fail-closed 回归）；[ ] 扩展 runner 覆盖完整 action matrix。
+- [x] 增加 Windows fixture；[x] 增加 opt-in WPF identity/bounds smoke test（双实例、snapshot identity、窗口移动后的 stale bounds）；[x] 增加 PowerShell 7 deterministic safety runner（WPF/WinForms、授权负例、strict app_post、缺失/空/空白/null member/字符串/分数/越界 runtime ID、从 snapshot HWND 解析的 exact child identity、同元数据元素 replacement/duplicate，以及每个 stale element-targeted action 的 fail-closed 回归）；[x] 扩展 runner 覆盖完整 action matrix。
 - [ ] 评估用 `PrintWindow` / Windows Graphics Capture 补一条不依赖窗口可见性的 background screenshot 路径。
 - [ ] 为必须依赖前台输入的 app/toolkit 场景补更明确的 capability/error，避免静默退到抢焦点行为。
 - [x] 将 Windows artifact 接入 npm release packaging，作为既有 npm root/alias packages 的 bundled artifacts 分发。
@@ -96,7 +96,7 @@
 - 2026-04-22：保留 `call --calls` 的同进程状态复用语义，Windows action tool 优先消费上一轮 `get_app_state` 的 `element_index` metadata。
 - 2026-04-22：真实 Codex App 测试显示 `list_apps` 可用，但 `get_app_state` 仍会被 UIA 属性读取异常拖垮；Windows snapshot renderer 改成字段级安全读取，并支持 `notepad.exe` 这类进程名输入。
 - 2026-04-22：PowerShell 对 .NET generic list 的 `@(...)` 包装会在返回对象时触发 `Argument types do not match`；Windows bridge 统一改成 `.ToArray()` 返回 UIA records/element collections。
-- 2026-04-22：`type_text` 不再只给顶层窗口发 `WM_CHAR`；优先寻找同进程可写 `ValuePattern` 文本元素并追加文本，找不到再走 window-message fallback。
+- 2026-04-22：`type_text` 不再只给顶层窗口发 `WM_CHAR`；当时优先寻找同进程可写 `ValuePattern` 文本元素并追加文本，找不到再走 window-message fallback。该历史行为后来被 focus-only contract 取代，不应作为当前 target-selection 约定。
 - 2026-04-22：为避免 Windows tools 主动抢占用户焦点，`Resolve-App` 默认不再 `Start-Process` 目标 app，`SetFocus` secondary action 默认返回错误；需要前台行为时分别设置 `OPEN_COMPUTER_USE_WINDOWS_ALLOW_APP_LAUNCH=1` 或 `OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOCUS_ACTIONS=1`。
 - 2026-04-22：Notepad 实测反馈 `type_text` 的 UIA `ValuePattern.SetValue` 会把窗口带到前台；默认改为 child HWND `EM_REPLACESEL` 后台消息路径，旧 UIA fallback 需要 `OPEN_COMPUTER_USE_WINDOWS_ALLOW_UIA_TEXT_FALLBACK=1`。
 - 2026-04-22：Windows 交互式 scheduled task 验证显示新 `type_text` 能写入 Notepad 且不会把前台从 Codex 切到 Notepad；Notepad 文本控件 UIA class 为 `RichEditD2DPT`，有 child native handle，可接收 `EM_REPLACESEL`。
@@ -106,3 +106,4 @@
 - 2026-08-23：新增可观察的 WPF/WinForms fixtures，并用计数器和值验证 UIA、native message 和 interactive input 路径。
 - 2026-08-25：审查发现 `press_key` 在前台授权缺失时仍会走未保护的 `PostMessage` fallback；删除该路径并在未授权时 fail closed。后续审查还收紧了非 global drag fallback：验证 HWND 所有权和每次 `PostMessage` 投递结果。最终通过注册的 `go run . mcp` source launcher 完成 WPF 9-tool matrix、native `BM_CLICK`、global click 和 thumb-centered drag；新 unsigned PE 在首次启动时被主机移除，待签名 release artifact 替代此本地开发 launcher。
 - 2026-08-27：元素索引动作改为只接受非空、数值类型有效、可表示为 signed 32-bit UIA component 的 exact `runtimeId`；空白、字符串、分数、null member 和越界值都拒绝。解析以 snapshot-bound HWND 建立当前 UIA 根；移除名称/automation-ID/类型的弱匹配，并在 UIA、frame 或输入投递前统一 fail closed。WPF/WinForms runner 新增这些 malformed-ID cases、replacement 后 old/new runtime-ID distinctness、fresh duplicate 独立寻址，以及 stale `click`、secondary、scroll、`set_value` 的实际回归。runtime-ID reuse 仍是 provider 级后续风险，不能以 metadata fallback 规避。
+- 2026-08-29：`type_text(app, text)` 固定为 focus-only contract：动作时刻只接受当前聚焦、可写的 `Edit` / `Document`，并验证目标进程及 snapshot-bound window 归属；移除 first-writable/current-tree 和顶层 `WM_CHAR` fallback。child edit HWND 仍优先，WPF/no-child-HWND 只在 `OPEN_COMPUTER_USE_WINDOWS_ALLOW_UIA_TEXT_FALLBACK=1` 下对同一 focused element 使用 `ValuePattern`，否则返回 bounded error；精确元素赋值使用 `set_value` + `element_index`。

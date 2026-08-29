@@ -27,6 +27,14 @@ function Test-MissingClickFrameResponse($response) {
     return ($null -ne $response -and -not $response.ok -and $response.error -eq 'Click requires an element with a valid frame or explicit finite x/y coordinates.')
 }
 
+function Test-TypeTextTargetResponse($response) {
+    return ($null -ne $response -and -not $response.ok -and $response.error -eq 'type_text requires a focused writable text control owned by the requested app/window; click/select the field first or use set_value with element_index.')
+}
+
+function Test-TypeTextFallbackResponse($response) {
+    return ($null -ne $response -and -not $response.ok -and $response.error -eq 'The focused text control has no usable native edit handle; UIA ValuePattern text fallback is disabled by default; set OPEN_COMPUTER_USE_WINDOWS_ALLOW_UIA_TEXT_FALLBACK=1 or use set_value with element_index.')
+}
+
 function Test-SameFixtureActionState($before, $after) {
     return (
         $before.auto -eq $after.auto -and
@@ -119,6 +127,17 @@ function Get-Snapshot([string]$title) {
     })
     Assert-Condition $response.ok ('Snapshot failed for ' + $title + ': ' + $response.error)
     return $response.snapshot
+}
+
+function Invoke-TypeText($state, $snapshot, [string]$text) {
+    return Invoke-Runtime ([pscustomobject]@{
+        tool = 'type_text'
+        app = $state.title
+        text = $text
+        expectedPid = [int]$snapshot.app.pid
+        expectedProcessStartTimeTicks = [int64]$snapshot.app.processStartTimeTicks
+        expectedMainWindowHandle = [int64]$snapshot.app.mainWindowHandle
+    })
 }
 
 function Wait-FixtureStateCondition($target, [scriptblock]$predicate, [string]$description) {
@@ -218,6 +237,40 @@ function Find-Element($snapshot, [string]$name, [string]$requiredAction, [bool]$
     return $null
 }
 
+function Set-FixtureFocus([int64]$hwndValue, [string]$name, [string]$controlTypeName, [string]$valuePrefix) {
+    $root = [Windows.Automation.AutomationElement]::FromHandle([IntPtr]$hwndValue)
+    $condition = New-Object Windows.Automation.PropertyCondition ([Windows.Automation.AutomationElement]::NameProperty), $name
+    $matches = @($root.FindAll([Windows.Automation.TreeScope]::Descendants, $condition))
+    foreach ($element in $matches) {
+        if ([string]$element.Current.ControlType.ProgrammaticName -ne $controlTypeName) {
+            continue
+        }
+        if (-not [string]::IsNullOrWhiteSpace($valuePrefix)) {
+            try {
+                $valuePattern = $element.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern)
+                if (-not ([string]$valuePattern.Current.Value).StartsWith($valuePrefix, [System.StringComparison]::Ordinal)) {
+                    continue
+                }
+            } catch {
+                continue
+            }
+        }
+        $element.SetFocus()
+        Start-Sleep -Milliseconds 180
+        $focused = [Windows.Automation.AutomationElement]::FocusedElement
+        Assert-Condition ($null -ne $focused) ('No focused element after selecting ' + $name)
+        Assert-Condition ([string]$focused.Current.Name -eq $name) ('Unexpected focused element after selecting ' + $name)
+        Assert-Condition ([string]$focused.Current.ControlType.ProgrammaticName -eq $controlTypeName) ('Unexpected focused control type after selecting ' + $name)
+        return [pscustomobject]@{
+            name = [string]$focused.Current.Name
+            controlType = [string]$focused.Current.ControlType.ProgrammaticName
+            processId = [int]$focused.Current.ProcessId
+            nativeWindowHandle = [int64]$focused.Current.NativeWindowHandle
+        }
+    }
+    throw ('Could not focus ' + $name + ' (' + $controlTypeName + ')')
+}
+
 function Restore-ProcessEnvironment($saved, [string[]]$names) {
     foreach ($name in $names) {
         if ($null -eq $saved[$name]) {
@@ -229,6 +282,8 @@ function Restore-ProcessEnvironment($saved, [string[]]$names) {
 }
 
 try {
+    Add-Type -AssemblyName UIAutomationClient
+    Add-Type -AssemblyName UIAutomationTypes
     New-Item -ItemType Directory -Path $runRoot -Force | Out-Null
     $targetA = Start-Fixture 'wpf-test-bench.ps1' 'A' 20 20
     $targetB = Start-Fixture 'wpf-test-bench.ps1' 'B' 1280 20
@@ -374,12 +429,19 @@ try {
         return $state.identityPrimaryValue -eq $addressedPrimaryValue -and $state.identityDuplicateValue -eq $replacementDuplicateBeforeAddress
     } 'first duplicate target update'
 
-    $duplicateSnapshot = Get-Snapshot $stateA.title
+    $duplicateSnapshot = $null
     $replacementDuplicateElement = $null
-    foreach ($record in (Find-SamePresentationElements $duplicateSnapshot $identityElementA)) {
-        if ($record.value -eq $replacementDuplicateBeforeAddress) {
-            $replacementDuplicateElement = $record
-            break
+    $duplicateLookupDeadline = [datetime]::UtcNow.AddSeconds(5)
+    while ([datetime]::UtcNow -lt $duplicateLookupDeadline -and $null -eq $replacementDuplicateElement) {
+        $duplicateSnapshot = Get-Snapshot $stateA.title
+        foreach ($record in (Find-SamePresentationElements $duplicateSnapshot $identityElementA)) {
+            if ($record.value -eq $replacementDuplicateBeforeAddress) {
+                $replacementDuplicateElement = $record
+                break
+            }
+        }
+        if ($null -eq $replacementDuplicateElement) {
+            Start-Sleep -Milliseconds 100
         }
     }
     Assert-Condition ($null -ne $replacementDuplicateElement) 'The second duplicate target was not independently addressable after the first update.'
@@ -511,6 +573,156 @@ try {
     $staleResult = Invoke-Runtime $staleDrag
     Assert-Condition ((-not $staleResult.ok) -and $staleResult.error -eq 'Target changed; call get_app_state again.') 'Stale bounds were not rejected.'
     $snapshotA = Get-Snapshot $stateA.title
+
+    # Focus changes here are fixture setup only; type_text itself must never call SetFocus.
+    $typeTextEnvironmentName = 'OPEN_COMPUTER_USE_WINDOWS_ALLOW_UIA_TEXT_FALLBACK'
+    $savedTypeTextEnvironment = [Environment]::GetEnvironmentVariable($typeTextEnvironmentName)
+    $focusedTypeTextResponse = $null
+    $nonEditableTypeTextResponse = $null
+    $duplicateTypeTextResponse = $null
+    $outsideWindowTypeTextResponse = $null
+    $disabledFallbackTypeTextResponse = $null
+    $nativeTypeTextResponse = $null
+    $focusedTypeTextAccepted = $false
+    $nonEditableTypeTextRejected = $false
+    $duplicateFocusedTypeTextIsolated = $false
+    $outsideWindowTypeTextRejected = $false
+    $disabledUIATextFallbackRejected = $false
+    $nativeFocusedTypeTextAccepted = $false
+    try {
+        $typeTextElement = Find-Element $snapshotA 'Type text target' 'SetValue' $false
+        Assert-Condition ($null -ne $typeTextElement) 'The WPF type_text target was not found.'
+        [Environment]::SetEnvironmentVariable($typeTextEnvironmentName, '1')
+
+        $beforeFocusedTypeText = Read-State $targetA.StatePath
+        $focusedType = Set-FixtureFocus $stateA.hwnd 'Type text target' 'ControlType.Edit' ''
+        Assert-Condition ($focusedType.processId -eq $snapshotA.app.pid) 'The WPF type_text target focus escaped the requested process.'
+        $focusedTypeTextResponse = Invoke-TypeText $stateA $snapshotA '焦点成功-✅'
+        Assert-Condition $focusedTypeTextResponse.ok ('Focused WPF type_text failed: ' + $focusedTypeTextResponse.error)
+        $afterFocusedTypeText = Wait-FixtureStateCondition $targetA {
+            param($state)
+            return $state.typed -eq ($beforeFocusedTypeText.typed + '焦点成功-✅')
+        } 'focused WPF type_text'
+        $focusedTypeTextAccepted = (
+            $focusedTypeTextResponse.ok -and
+            $afterFocusedTypeText.typed -eq ($beforeFocusedTypeText.typed + '焦点成功-✅') -and
+            $afterFocusedTypeText.identityPrimaryValue -eq $beforeFocusedTypeText.identityPrimaryValue -and
+            $afterFocusedTypeText.identityDuplicateValue -eq $beforeFocusedTypeText.identityDuplicateValue
+        )
+        Assert-Condition $focusedTypeTextAccepted 'Focused WPF type_text did not change only the intended field.'
+
+        $replaceIdentityForTypeText = Find-Element $snapshotA 'Replace identity target' 'Invoke' $false
+        Assert-Condition ($null -ne $replaceIdentityForTypeText) 'The type_text non-editable focus target was not found.'
+        $replaceIdentityForTypeText | Out-Null
+        $focusButtonForTypeText = Set-FixtureFocus $stateA.hwnd 'Replace identity target' 'ControlType.Button' ''
+        $beforeNonEditableTypeText = Read-State $targetA.StatePath
+        $nonEditableTypeTextResponse = Invoke-TypeText $stateA $snapshotA 'must-not-write-from-button'
+        Assert-Condition (Test-TypeTextTargetResponse $nonEditableTypeTextResponse) 'Non-editable focus did not return the bounded type_text target error.'
+        $afterNonEditableTypeText = Read-State $targetA.StatePath
+        $nonEditableTypeTextRejected = (
+            (Test-TypeTextTargetResponse $nonEditableTypeTextResponse) -and
+            $afterNonEditableTypeText.typed -eq $beforeNonEditableTypeText.typed -and
+            $afterNonEditableTypeText.identityPrimaryValue -eq $beforeNonEditableTypeText.identityPrimaryValue -and
+            $afterNonEditableTypeText.identityDuplicateValue -eq $beforeNonEditableTypeText.identityDuplicateValue -and
+            $nonEditableTypeTextResponse.error -notmatch 'runtime\.ps1|ScriptStackTrace|line [0-9]+'
+        )
+        Assert-Condition $nonEditableTypeTextRejected 'Non-editable type_text focus changed fixture state or leaked diagnostics.'
+
+        $duplicateTypeTextRecord = $null
+        foreach ($record in $snapshotA.elements) {
+            if ($record.name -eq 'Identity replacement target' -and $record.controlType -eq 'ControlType.Edit' -and $record.actions -contains 'SetValue' -and $record.value -like 'identity-duplicate-*') {
+                $duplicateTypeTextRecord = $record
+                break
+            }
+        }
+        Assert-Condition ($null -ne $duplicateTypeTextRecord) 'The duplicate focused type_text target was not found.'
+        $focusDuplicateForTypeText = Set-FixtureFocus $stateA.hwnd 'Identity replacement target' 'ControlType.Edit' 'identity-duplicate-'
+        $beforeDuplicateTypeText = Read-State $targetA.StatePath
+        $duplicateTypeTextResponse = Invoke-TypeText $stateA $snapshotA '重复成功-✅'
+        Assert-Condition $duplicateTypeTextResponse.ok ('Focused duplicate WPF type_text failed: ' + $duplicateTypeTextResponse.error)
+        $afterDuplicateTypeText = Wait-FixtureStateCondition $targetA {
+            param($state)
+            return $state.identityDuplicateValue -eq ($beforeDuplicateTypeText.identityDuplicateValue + '重复成功-✅')
+        } 'focused duplicate WPF type_text'
+        $duplicateFocusedTypeTextIsolated = (
+            $duplicateTypeTextResponse.ok -and
+            $afterDuplicateTypeText.identityPrimaryValue -eq $beforeDuplicateTypeText.identityPrimaryValue -and
+            $afterDuplicateTypeText.identityDuplicateValue -eq ($beforeDuplicateTypeText.identityDuplicateValue + '重复成功-✅') -and
+            $afterDuplicateTypeText.typed -eq $beforeDuplicateTypeText.typed
+        )
+        Assert-Condition $duplicateFocusedTypeTextIsolated 'Focused duplicate type_text did not stay on the focused control.'
+
+        $snapshotBForTypeText = Get-Snapshot $stateB.title
+        $focusOutsideTypeText = Set-FixtureFocus $stateB.hwnd 'Type text target' 'ControlType.Edit' ''
+        $beforeOutsideTypeTextA = Read-State $targetA.StatePath
+        $beforeOutsideTypeTextB = Read-State $targetB.StatePath
+        $outsideWindowTypeTextResponse = Invoke-TypeText $stateA $snapshotA 'must-not-cross-window'
+        Assert-Condition (Test-TypeTextTargetResponse $outsideWindowTypeTextResponse) 'Outside-window focus did not return the bounded type_text target error.'
+        $afterOutsideTypeTextA = Read-State $targetA.StatePath
+        $afterOutsideTypeTextB = Read-State $targetB.StatePath
+        $outsideWindowTypeTextRejected = (
+            (Test-TypeTextTargetResponse $outsideWindowTypeTextResponse) -and
+            $afterOutsideTypeTextA.typed -eq $beforeOutsideTypeTextA.typed -and
+            $afterOutsideTypeTextA.identityPrimaryValue -eq $beforeOutsideTypeTextA.identityPrimaryValue -and
+            $afterOutsideTypeTextA.identityDuplicateValue -eq $beforeOutsideTypeTextA.identityDuplicateValue -and
+            $afterOutsideTypeTextB.typed -eq $beforeOutsideTypeTextB.typed
+        )
+        Assert-Condition $outsideWindowTypeTextRejected 'Outside-window type_text changed a fixture state.'
+
+        $focusTypeForDisabledFallback = Set-FixtureFocus $stateA.hwnd 'Type text target' 'ControlType.Edit' ''
+        $savedFallbackForDisabledTest = [Environment]::GetEnvironmentVariable($typeTextEnvironmentName)
+        try {
+            [Environment]::SetEnvironmentVariable($typeTextEnvironmentName, $null)
+            $beforeDisabledFallback = Read-State $targetA.StatePath
+            $disabledFallbackTypeTextResponse = Invoke-TypeText $stateA $snapshotA 'must-not-use-disabled-fallback'
+            Assert-Condition (Test-TypeTextFallbackResponse $disabledFallbackTypeTextResponse) 'Disabled UIA text fallback did not return its bounded capability error.'
+            $afterDisabledFallback = Read-State $targetA.StatePath
+            $disabledUIATextFallbackRejected = (
+                (Test-TypeTextFallbackResponse $disabledFallbackTypeTextResponse) -and
+                $afterDisabledFallback.typed -eq $beforeDisabledFallback.typed -and
+                $disabledFallbackTypeTextResponse.error -notmatch 'runtime\.ps1|ScriptStackTrace|line [0-9]+'
+            )
+            Assert-Condition $disabledUIATextFallbackRejected 'Disabled UIA text fallback changed state or leaked diagnostics.'
+        } finally {
+            if ($null -eq $savedFallbackForDisabledTest) {
+                Remove-Item -LiteralPath ('Env:' + $typeTextEnvironmentName) -ErrorAction SilentlyContinue
+            } else {
+                Set-Item -Path ('Env:' + $typeTextEnvironmentName) -Value $savedFallbackForDisabledTest
+            }
+        }
+
+        $nativeTypeElement = Find-Element $nativeSnapshot 'Native type_text target' 'SetValue' $true
+        Assert-Condition ($null -ne $nativeTypeElement) 'The native type_text target was not found with a child HWND.'
+        $focusNativeTypeText = Set-FixtureFocus $nativeState.hwnd 'Native type_text target' 'ControlType.Edit' ''
+        $savedFallbackForNativeTest = [Environment]::GetEnvironmentVariable($typeTextEnvironmentName)
+        try {
+            [Environment]::SetEnvironmentVariable($typeTextEnvironmentName, $null)
+            $beforeNativeTypeText = Read-State $nativeTarget.StatePath
+            $nativeTypeTextResponse = Invoke-TypeText $nativeState $nativeSnapshot '原生成功-✅'
+            Assert-Condition $nativeTypeTextResponse.ok ('Native child-HWND type_text failed: ' + $nativeTypeTextResponse.error)
+            $afterNativeTypeText = Wait-FixtureStateCondition $nativeTarget {
+                param($state)
+                return $state.typed -eq ($beforeNativeTypeText.typed + '原生成功-✅')
+            } 'native child-HWND type_text'
+            $nativeFocusedTypeTextAccepted = (
+                $nativeTypeTextResponse.ok -and
+                $afterNativeTypeText.typed -eq ($beforeNativeTypeText.typed + '原生成功-✅')
+            )
+            Assert-Condition $nativeFocusedTypeTextAccepted 'Native child-HWND type_text did not update its intended field.'
+        } finally {
+            if ($null -eq $savedFallbackForNativeTest) {
+                Remove-Item -LiteralPath ('Env:' + $typeTextEnvironmentName) -ErrorAction SilentlyContinue
+            } else {
+                Set-Item -Path ('Env:' + $typeTextEnvironmentName) -Value $savedFallbackForNativeTest
+            }
+        }
+    } finally {
+        if ($null -eq $savedTypeTextEnvironment) {
+            Remove-Item -LiteralPath ('Env:' + $typeTextEnvironmentName) -ErrorAction SilentlyContinue
+        } else {
+            Set-Item -Path ('Env:' + $typeTextEnvironmentName) -Value $savedTypeTextEnvironment
+        }
+    }
 
     $autoCompatibilityElement = Find-Element $snapshotA 'Auto click target' 'Invoke' $false
     Assert-Condition ($null -ne $autoCompatibilityElement -and $null -ne $autoCompatibilityElement.frame) 'The valid-frame auto click element was not found.'
@@ -823,6 +1035,12 @@ try {
         $identityPinned,
         $mismatchRejected,
         $staleBoundsRejected,
+        $focusedTypeTextAccepted,
+        $nonEditableTypeTextRejected,
+        $duplicateFocusedTypeTextIsolated,
+        $outsideWindowTypeTextRejected,
+        $disabledUIATextFallbackRejected,
+        $nativeFocusedTypeTextAccepted,
         $missingFrameClickRejected,
         $validFrameAutoClick,
         $semanticClickWithoutFrame,
@@ -852,6 +1070,12 @@ try {
         identityPinned = $identityPinned
         mismatchRejected = $mismatchRejected
         staleBoundsRejected = $staleBoundsRejected
+        focusedTypeTextAccepted = $focusedTypeTextAccepted
+        nonEditableTypeTextRejected = $nonEditableTypeTextRejected
+        duplicateFocusedTypeTextIsolated = $duplicateFocusedTypeTextIsolated
+        outsideWindowTypeTextRejected = $outsideWindowTypeTextRejected
+        disabledUIATextFallbackRejected = $disabledUIATextFallbackRejected
+        nativeFocusedTypeTextAccepted = $nativeFocusedTypeTextAccepted
         missingFrameClickRejected = $missingFrameClickRejected
         validFrameAutoClick = $validFrameAutoClick
         semanticClickWithoutFrame = $semanticClickWithoutFrame
