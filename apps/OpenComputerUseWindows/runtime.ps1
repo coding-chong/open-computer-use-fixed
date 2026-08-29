@@ -464,6 +464,70 @@ function Get-ScreenPoint($localFrame, $windowBounds) {
     }
 }
 
+function Get-ValidatedClickPoint($elementRecord, $operation, $windowBounds) {
+    $errorMessage = "Click requires an element with a valid frame or explicit finite x/y coordinates."
+    if ($null -eq $windowBounds -or $null -eq $windowBounds.x -or $null -eq $windowBounds.y -or $null -eq $windowBounds.width -or $null -eq $windowBounds.height) {
+        throw $errorMessage
+    }
+
+    $frame = $null
+    if ($null -ne $elementRecord) {
+        $frame = $elementRecord.frame
+    }
+    $validFrame = $false
+    if ($null -ne $frame -and $null -ne $frame.x -and $null -ne $frame.y -and $null -ne $frame.width -and $null -ne $frame.height) {
+        try {
+            $frameValues = @(
+                [double]$frame.x
+                [double]$frame.y
+                [double]$frame.width
+                [double]$frame.height
+            )
+            $validFrame = $true
+            foreach ($value in $frameValues) {
+                if ([double]::IsNaN($value) -or [double]::IsInfinity($value)) {
+                    $validFrame = $false
+                    break
+                }
+            }
+            if ($validFrame -and ($frameValues[2] -le 0 -or $frameValues[3] -le 0)) {
+                $validFrame = $false
+            }
+        } catch {
+            $validFrame = $false
+        }
+    }
+
+    if ($validFrame) {
+        $point = Get-ScreenPoint $frame $windowBounds
+        if ($null -ne $point) {
+            return $point
+        }
+    }
+
+    if ($null -eq $operation -or $null -eq $operation.x -or $null -eq $operation.y) {
+        throw $errorMessage
+    }
+    try {
+        $coordinateValues = @(
+            [double]$operation.x
+            [double]$operation.y
+        )
+    } catch {
+        throw $errorMessage
+    }
+    foreach ($value in $coordinateValues) {
+        if ([double]::IsNaN($value) -or [double]::IsInfinity($value)) {
+            throw $errorMessage
+        }
+    }
+
+    return [pscustomobject]@{
+        x = [int][math]::Round($windowBounds.x + $coordinateValues[0])
+        y = [int][math]::Round($windowBounds.y + $coordinateValues[1])
+    }
+}
+
 function Get-ValidatedScrollFallbackPoint($elementRecord, $windowBounds) {
     $errorMessage = "Scroll requires an element with a valid frame when ScrollPattern is unavailable."
     if ($null -eq $elementRecord) {
@@ -1639,14 +1703,7 @@ try {
                     }
                 } elseif ($clickMethod -eq "app_post") {
                     Assert-SnapshotCoordinateBounds $hwnd $windowBounds
-                    if ($null -ne $operation.element -and $null -ne $operation.element.frame) {
-                        $point = Get-ScreenPoint $operation.element.frame $windowBounds
-                    } else {
-                        $point = [pscustomobject]@{
-                            x = [int][math]::Round($windowBounds.x + [double]$operation.x)
-                            y = [int][math]::Round($windowBounds.y + [double]$operation.y)
-                        }
-                    }
+                    $point = Get-ValidatedClickPoint $operation.element $operation $windowBounds
                     $targetHwnd = Resolve-AppPostTargetHandle $process $hwnd $element $point.x $point.y
                     if ($operation.mouse_button -eq "left" -and (Test-NativeButtonElement $element)) {
                         Send-NativeButtonClick $process $targetHwnd ([int]$operation.click_count)
@@ -1655,14 +1712,7 @@ try {
                     }
                 } elseif ($clickMethod -eq "global") {
                     Assert-SnapshotCoordinateBounds $hwnd $windowBounds
-                    if ($null -ne $operation.element -and $null -ne $operation.element.frame) {
-                        $point = Get-ScreenPoint $operation.element.frame $windowBounds
-                    } else {
-                        $point = [pscustomobject]@{
-                            x = [int][math]::Round($windowBounds.x + [double]$operation.x)
-                            y = [int][math]::Round($windowBounds.y + [double]$operation.y)
-                        }
-                    }
+                    $point = Get-ValidatedClickPoint $operation.element $operation $windowBounds
                     Send-InteractiveMouseClick $process $hwnd $point.x $point.y $operation.mouse_button ([int]$operation.click_count)
                 } elseif ($clickMethod -eq "sky_click") {
                     throw "click_method 'sky_click' is not supported on Windows"
@@ -1673,14 +1723,7 @@ try {
                     }
                     if (-not $handled) {
                         Assert-SnapshotCoordinateBounds $hwnd $windowBounds
-                        if ($null -ne $operation.element -and $null -ne $operation.element.frame) {
-                            $point = Get-ScreenPoint $operation.element.frame $windowBounds
-                        } else {
-                            $point = [pscustomobject]@{
-                                x = [int][math]::Round($windowBounds.x + [double]$operation.x)
-                                y = [int][math]::Round($windowBounds.y + [double]$operation.y)
-                            }
-                        }
+                        $point = Get-ValidatedClickPoint $operation.element $operation $windowBounds
                         Send-MouseClick $process $hwnd $point.x $point.y $operation.mouse_button ([int]$operation.click_count)
                     }
                 } else {
@@ -1744,7 +1787,7 @@ try {
 } catch {
     $message = $PSItem.Exception.Message
     # Keep the safety boundary actionable and bounded; do not expose internal stack details.
-    if ($message -ne "Target changed; call get_app_state again.") {
+    if ($message -ne "Target changed; call get_app_state again." -and $message -ne "Click requires an element with a valid frame or explicit finite x/y coordinates.") {
         $stackTrace = $PSItem.ScriptStackTrace
         if (-not [string]::IsNullOrWhiteSpace($stackTrace)) {
             $message = "$message at $stackTrace"

@@ -23,6 +23,26 @@ function Assert-TargetChangedResponse($response, [string]$message) {
     Assert-Condition (Test-TargetChangedResponse $response) $message
 }
 
+function Test-MissingClickFrameResponse($response) {
+    return ($null -ne $response -and -not $response.ok -and $response.error -eq 'Click requires an element with a valid frame or explicit finite x/y coordinates.')
+}
+
+function Test-SameFixtureActionState($before, $after) {
+    return (
+        $before.auto -eq $after.auto -and
+        $before.accessibility -eq $after.accessibility -and
+        $before.appPost -eq $after.appPost -and
+        $before.secondary -eq $after.secondary -and
+        $before.typed -eq $after.typed -and
+        $before.setValue -eq $after.setValue -and
+        $before.eventCount -eq $after.eventCount -and
+        $before.dragValue -eq $after.dragValue -and
+        $before.scrollEvents -eq $after.scrollEvents -and
+        $before.identityPrimaryValue -eq $after.identityPrimaryValue -and
+        $before.identityDuplicateValue -eq $after.identityDuplicateValue
+    )
+}
+
 function Read-State([string]$path) {
     return (Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json)
 }
@@ -492,6 +512,65 @@ try {
     Assert-Condition ((-not $staleResult.ok) -and $staleResult.error -eq 'Target changed; call get_app_state again.') 'Stale bounds were not rejected.'
     $snapshotA = Get-Snapshot $stateA.title
 
+    $autoCompatibilityElement = Find-Element $snapshotA 'Auto click target' 'Invoke' $false
+    Assert-Condition ($null -ne $autoCompatibilityElement -and $null -ne $autoCompatibilityElement.frame) 'The valid-frame auto click element was not found.'
+    $beforeAutoCompatibility = Read-State $targetA.StatePath
+    $autoCompatibilityResult = Invoke-Runtime ([pscustomobject]@{
+        tool = 'click'; app = $stateA.title; element = $autoCompatibilityElement; click_count = 1; mouse_button = 'left'; click_method = 'auto'
+        windowBounds = $snapshotA.windowBounds; expectedPid = [int]$snapshotA.app.pid
+        expectedProcessStartTimeTicks = [int64]$snapshotA.app.processStartTimeTicks; expectedMainWindowHandle = [int64]$snapshotA.app.mainWindowHandle
+    })
+    Assert-Condition $autoCompatibilityResult.ok ('Valid-frame auto click failed: ' + $autoCompatibilityResult.error)
+    $afterAutoCompatibility = Wait-FixtureStateCondition $targetA {
+        param($state)
+        return $state.auto -eq ($beforeAutoCompatibility.auto + 1)
+    } 'valid-frame auto click'
+
+    $semanticClickElement = Find-Element $snapshotA 'Accessibility click target' 'Invoke' $false
+    Assert-Condition ($null -ne $semanticClickElement) 'The semantic no-frame click element was not found.'
+    $semanticClickWithoutFrameElement = $semanticClickElement | ConvertTo-Json -Depth 50 | ConvertFrom-Json
+    $semanticClickWithoutFrameElement.frame = $null
+    $beforeSemanticClick = $afterAutoCompatibility
+    $semanticClickWithoutFrameResult = Invoke-Runtime ([pscustomobject]@{
+        tool = 'click'; app = $stateA.title; element = $semanticClickWithoutFrameElement; click_count = 1; mouse_button = 'left'; click_method = 'accessibility'
+        windowBounds = $snapshotA.windowBounds; expectedPid = [int]$snapshotA.app.pid
+        expectedProcessStartTimeTicks = [int64]$snapshotA.app.processStartTimeTicks; expectedMainWindowHandle = [int64]$snapshotA.app.mainWindowHandle
+    })
+    Assert-Condition $semanticClickWithoutFrameResult.ok ('Semantic accessibility click without a frame failed: ' + $semanticClickWithoutFrameResult.error)
+    $afterSemanticClick = Wait-FixtureStateCondition $targetA {
+        param($state)
+        return $state.accessibility -eq ($beforeSemanticClick.accessibility + 1)
+    } 'semantic accessibility click without frame'
+
+    $clickFallbackElement = Find-Element $snapshotA 'Set value target' 'SetValue' $false
+    Assert-Condition ($null -ne $clickFallbackElement -and $null -ne $clickFallbackElement.frame) 'The click fallback test element was not found with a frame.'
+    Assert-Condition (-not ($clickFallbackElement.actions -contains 'Invoke')) 'The click fallback test element unexpectedly exposes InvokePattern.'
+    $missingClickElement = $clickFallbackElement | ConvertTo-Json -Depth 50 | ConvertFrom-Json
+    $missingClickElement.frame = $null
+    $missingClickBaseline = Read-State $targetA.StatePath
+    $missingClickResults = @{}
+    $clickEnvironmentNames = @('OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT', 'OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS')
+    $savedClickEnvironment = @{}
+    foreach ($name in $clickEnvironmentNames) {
+        $savedClickEnvironment[$name] = [Environment]::GetEnvironmentVariable($name)
+        Set-Item -Path ('Env:' + $name) -Value '1'
+    }
+    try {
+        foreach ($method in @('auto', 'app_post', 'global')) {
+            $missingClickResults[$method] = Invoke-Runtime ([pscustomobject]@{
+                tool = 'click'; app = $stateA.title; element = $missingClickElement; click_count = 1; mouse_button = 'left'; click_method = $method
+                windowBounds = $snapshotA.windowBounds; expectedPid = [int]$snapshotA.app.pid
+                expectedProcessStartTimeTicks = [int64]$snapshotA.app.processStartTimeTicks; expectedMainWindowHandle = [int64]$snapshotA.app.mainWindowHandle
+            })
+            Assert-Condition (Test-MissingClickFrameResponse $missingClickResults[$method]) ('Missing-frame ' + $method + ' click did not fail with the bounded frame error.')
+            Start-Sleep -Milliseconds 150
+            $afterMissingClick = Read-State $targetA.StatePath
+            Assert-Condition (Test-SameFixtureActionState $missingClickBaseline $afterMissingClick) ('Missing-frame ' + $method + ' click changed fixture state.')
+        }
+    } finally {
+        Restore-ProcessEnvironment $savedClickEnvironment $clickEnvironmentNames
+    }
+
     $semanticScrollElement = Find-Element $snapshotA 'Scroll test container' 'Scroll' $false
     Assert-Condition ($null -ne $semanticScrollElement) 'The WPF ScrollViewer did not expose ScrollPattern.'
     $semanticScrollWithoutFrame = $semanticScrollElement | ConvertTo-Json -Depth 50 | ConvertFrom-Json
@@ -585,7 +664,23 @@ try {
     $nativeAfter = Read-State $nativeTarget.StatePath
     Assert-Condition ($nativeAfter.clicks -eq 1 -and $nativeAfter.buttonDown -eq 0 -and $nativeAfter.buttonUp -eq 0) 'Native BM_CLICK counters were unexpected.'
 
-    $outsideBefore = $nativeAfter
+    $explicitCoordinateButton = $nativeButton | ConvertTo-Json -Depth 50 | ConvertFrom-Json
+    $explicitCoordinateX = [double]$nativeButton.frame.x + ([double]$nativeButton.frame.width / 2)
+    $explicitCoordinateY = [double]$nativeButton.frame.y + ([double]$nativeButton.frame.height / 2)
+    $explicitCoordinateButton.frame = $null
+    $explicitCoordinateResult = Invoke-Runtime ([pscustomobject]@{
+        tool = 'click'; app = $nativeState.title; element = $explicitCoordinateButton; x = $explicitCoordinateX; y = $explicitCoordinateY
+        click_count = 1; mouse_button = 'left'; click_method = 'app_post'; windowBounds = $nativeSnapshot.windowBounds
+        expectedPid = [int]$nativeSnapshot.app.pid; expectedProcessStartTimeTicks = [int64]$nativeSnapshot.app.processStartTimeTicks
+        expectedMainWindowHandle = [int64]$nativeSnapshot.app.mainWindowHandle
+    })
+    Assert-Condition $explicitCoordinateResult.ok ('Explicit coordinates without an element frame failed: ' + $explicitCoordinateResult.error)
+    $nativeAfterExplicitCoordinate = Wait-FixtureStateCondition $nativeTarget {
+        param($state)
+        return $state.clicks -eq 2 -and $state.buttonDown -eq 0 -and $state.buttonUp -eq 0
+    } 'explicit-coordinate native BM_CLICK'
+
+    $outsideBefore = $nativeAfterExplicitCoordinate
     $outsideAppPost = Invoke-Runtime ([pscustomobject]@{
         tool = 'click'; app = $nativeState.title; x = -100; y = -100; click_count = 1; mouse_button = 'left'; click_method = 'app_post'
         windowBounds = $nativeSnapshot.windowBounds; expectedPid = [int]$nativeSnapshot.app.pid
@@ -620,6 +715,25 @@ try {
         (Test-TargetChangedResponse $staleSecondaryResult) -and
         (Test-TargetChangedResponse $staleScrollResult) -and
         (Test-TargetChangedResponse $staleElementResult)
+    )
+    $missingFrameClickRejected = (
+        (Test-MissingClickFrameResponse $missingClickResults['auto']) -and
+        (Test-MissingClickFrameResponse $missingClickResults['app_post']) -and
+        (Test-MissingClickFrameResponse $missingClickResults['global'])
+    )
+    $validFrameAutoClick = (
+        $autoCompatibilityResult.ok -and
+        $afterAutoCompatibility.auto -eq ($beforeAutoCompatibility.auto + 1)
+    )
+    $semanticClickWithoutFrame = (
+        $semanticClickWithoutFrameResult.ok -and
+        $afterSemanticClick.accessibility -eq ($beforeSemanticClick.accessibility + 1)
+    )
+    $explicitCoordinateClickAccepted = (
+        $explicitCoordinateResult.ok -and
+        $nativeAfterExplicitCoordinate.clicks -eq 2 -and
+        $nativeAfterExplicitCoordinate.buttonDown -eq 0 -and
+        $nativeAfterExplicitCoordinate.buttonUp -eq 0
     )
     $identityPinned = (
         $crossResult.ok -and
@@ -709,6 +823,10 @@ try {
         $identityPinned,
         $mismatchRejected,
         $staleBoundsRejected,
+        $missingFrameClickRejected,
+        $validFrameAutoClick,
+        $semanticClickWithoutFrame,
+        $explicitCoordinateClickAccepted,
         $emptyRuntimeIdRejected,
         $missingRuntimeIdRejected,
         $malformedRuntimeIdRejected,
@@ -734,6 +852,10 @@ try {
         identityPinned = $identityPinned
         mismatchRejected = $mismatchRejected
         staleBoundsRejected = $staleBoundsRejected
+        missingFrameClickRejected = $missingFrameClickRejected
+        validFrameAutoClick = $validFrameAutoClick
+        semanticClickWithoutFrame = $semanticClickWithoutFrame
+        explicitCoordinateClickAccepted = $explicitCoordinateClickAccepted
         emptyRuntimeIdRejected = $emptyRuntimeIdRejected
         missingRuntimeIdRejected = $missingRuntimeIdRejected
         malformedRuntimeIdRejected = $malformedRuntimeIdRejected

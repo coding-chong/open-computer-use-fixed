@@ -129,6 +129,41 @@ func TestWindowsFixtureIdentityAndBoundsSmoke(t *testing.T) {
 		t.Fatalf("mismatched identity changed fixture state: A=%+v B=%+v", stateAAfterIdentity, stateBAfterIdentity)
 	}
 
+	for _, action := range setRecord.Actions {
+		if action == "Invoke" {
+			t.Fatal("the missing-frame click regression target unexpectedly exposes InvokePattern")
+		}
+	}
+	clickRecord := *setRecord
+	clickRecord.Frame = nil
+	clickBaseline := readFixtureState(t, filepath.Join(runDir, "A-state.json"))
+	t.Setenv("OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT", "1")
+	t.Setenv("OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS", "1")
+	for _, method := range []string{"auto", "app_post", "global"} {
+		missingFrameResponse, missingFrameErr := runPowerShell(psRequest{
+			Tool:                     "click",
+			App:                      stateA.Title,
+			Element:                  &clickRecord,
+			ClickCount:               1,
+			MouseButton:              "left",
+			ClickMethod:              method,
+			WindowBounds:             snapshotA.WindowBounds,
+			ExpectedPID:              snapshotA.App.PID,
+			ExpectedStartTimeTicks:   snapshotA.App.ProcessStartTimeTicks,
+			ExpectedMainWindowHandle: snapshotA.App.MainWindowHandle,
+		})
+		if missingFrameErr != nil {
+			t.Fatalf("missing-frame %s click invocation: %v", method, missingFrameErr)
+		}
+		if missingFrameResponse.OK || missingFrameResponse.Error != "Click requires an element with a valid frame or explicit finite x/y coordinates." {
+			t.Fatalf("missing-frame %s click was not rejected with the bounded frame error: %+v", method, missingFrameResponse)
+		}
+		clickAfter := readFixtureState(t, filepath.Join(runDir, "A-state.json"))
+		if !sameFixtureObservableState(clickBaseline, clickAfter) {
+			t.Fatalf("missing-frame %s click changed fixture state: before=%+v after=%+v", method, clickBaseline, clickAfter)
+		}
+	}
+
 	if snapshotA.WindowBounds == nil {
 		t.Fatal("snapshot A has no bounds")
 	}

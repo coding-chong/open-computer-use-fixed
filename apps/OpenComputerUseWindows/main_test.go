@@ -15,6 +15,9 @@ func TestToolDefinitionCount(t *testing.T) {
 
 func TestClickMethodSchemaAndParser(t *testing.T) {
 	tool := findToolDefinition(t, "click")
+	if !strings.Contains(tool.Description, "Element-targeted coordinate fallback requires a valid snapshot frame or explicit finite x/y") {
+		t.Fatal("click description must document the missing-frame coordinate boundary")
+	}
 	properties := tool.InputSchema["properties"].(map[string]any)
 	method := properties["click_method"].(map[string]any)
 	values := method["enum"].([]string)
@@ -167,7 +170,7 @@ func TestWindowsRuntimeRequiresExactValidElementIdentity(t *testing.T) {
 		"$element = Find-Element $rootHwnd $record",
 		"if ($null -eq $element) {",
 		"$element = Resolve-SnapshotElement $hwnd $operation.element",
-		"if ($message -ne \"Target changed; call get_app_state again.\") {",
+		"$message -ne \"Target changed; call get_app_state again.\"",
 	} {
 		if !strings.Contains(windowsRuntimeScript, marker) {
 			t.Fatalf("Windows element identity contract missing %q", marker)
@@ -299,6 +302,125 @@ func TestWindowsScrollFallbackValidatesFrameBeforeDelivery(t *testing.T) {
 	}
 	if strings.Contains(scrollBranch, "$operation.element.frame") {
 		t.Fatal("scroll dispatch must not dereference the optional frame directly")
+	}
+}
+
+func TestClickRequestPreservesOmittedAndExplicitZeroCoordinates(t *testing.T) {
+	omitted, err := json.Marshal(psRequest{
+		Tool:    "click",
+		Element: &elementRecord{Index: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var omittedPayload map[string]any
+	if err := json.Unmarshal(omitted, &omittedPayload); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := omittedPayload["x"]; ok {
+		t.Fatalf("omitted x was serialized: %s", omitted)
+	}
+	if _, ok := omittedPayload["y"]; ok {
+		t.Fatalf("omitted y was serialized: %s", omitted)
+	}
+
+	zero := 0.0
+	explicit, err := json.Marshal(psRequest{
+		Tool:    "click",
+		Element: &elementRecord{Index: 1},
+		X:       &zero,
+		Y:       &zero,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var explicitPayload map[string]any
+	if err := json.Unmarshal(explicit, &explicitPayload); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"x", "y"} {
+		value, ok := explicitPayload[key]
+		if !ok || value != float64(0) {
+			t.Fatalf("explicit zero %s was not preserved: %s", key, explicit)
+		}
+	}
+}
+
+func TestWindowsClickFallbackValidatesPointSources(t *testing.T) {
+	const helperStartMarker = "function Get-ValidatedClickPoint($elementRecord, $operation, $windowBounds)"
+	helperStart := strings.Index(windowsRuntimeScript, helperStartMarker)
+	if helperStart < 0 {
+		t.Fatal("click point-validation helper is missing")
+	}
+	helperEndOffset := strings.Index(windowsRuntimeScript[helperStart:], "function Get-ValidatedScrollFallbackPoint")
+	if helperEndOffset < 0 {
+		t.Fatal("could not bound click point-validation helper")
+	}
+	helper := windowsRuntimeScript[helperStart : helperStart+helperEndOffset]
+	for _, marker := range []string{
+		"Click requires an element with a valid frame or explicit finite x/y coordinates.",
+		"$null -eq $operation.x -or $null -eq $operation.y",
+		"[double]::IsNaN",
+		"[double]::IsInfinity",
+		"$frameValues[2] -le 0 -or $frameValues[3] -le 0",
+		"Get-ScreenPoint $frame $windowBounds",
+		"[double]$operation.x",
+		"[double]$operation.y",
+	} {
+		if !strings.Contains(helper, marker) {
+			t.Fatalf("click point validation missing %q", marker)
+		}
+	}
+
+	const clickStartMarker = `"click" {`
+	clickStart := strings.Index(windowsRuntimeScript, clickStartMarker)
+	if clickStart < 0 {
+		t.Fatal("could not find click dispatch branch")
+	}
+	clickEndOffset := strings.Index(windowsRuntimeScript[clickStart:], `"perform_secondary_action" {`)
+	if clickEndOffset < 0 {
+		t.Fatal("could not bound click dispatch branch")
+	}
+	clickBranch := windowsRuntimeScript[clickStart : clickStart+clickEndOffset]
+	const pointCall = "Get-ValidatedClickPoint $operation.element $operation $windowBounds"
+	if strings.Count(clickBranch, pointCall) != 3 {
+		t.Fatalf("click dispatch must use one guarded point path for app_post, global, and auto; count=%d", strings.Count(clickBranch, pointCall))
+	}
+	for _, forbidden := range []string{
+		"$operation.element.frame",
+		"[double]$operation.x",
+		"[double]$operation.y",
+	} {
+		if strings.Contains(clickBranch, forbidden) {
+			t.Fatalf("click dispatch retains an unguarded coordinate fallback %q", forbidden)
+		}
+	}
+
+	assertBranchOrder := func(name, startMarker, endMarker, deliveryMarker string) {
+		t.Helper()
+		start := strings.Index(clickBranch, startMarker)
+		if start < 0 {
+			t.Fatalf("could not find %s click branch", name)
+		}
+		bodyStart := start + len(startMarker)
+		endOffset := strings.Index(clickBranch[bodyStart:], endMarker)
+		if endOffset < 0 {
+			t.Fatalf("could not bound %s click branch", name)
+		}
+		branch := clickBranch[bodyStart : bodyStart+endOffset]
+		boundsOffset := strings.Index(branch, "Assert-SnapshotCoordinateBounds $hwnd $windowBounds")
+		pointOffset := strings.Index(branch, pointCall)
+		deliveryOffset := strings.Index(branch, deliveryMarker)
+		if boundsOffset < 0 || pointOffset < 0 || deliveryOffset < 0 || boundsOffset > pointOffset || pointOffset > deliveryOffset {
+			t.Fatalf("%s click branch does not validate bounds, resolve the point, then deliver: %q", name, branch)
+		}
+	}
+	assertBranchOrder("app_post", `} elseif ($clickMethod -eq "app_post") {`, `} elseif ($clickMethod -eq "global") {`, "Resolve-AppPostTargetHandle")
+	assertBranchOrder("global", `} elseif ($clickMethod -eq "global") {`, `} elseif ($clickMethod -eq "sky_click") {`, "Send-InteractiveMouseClick")
+	assertBranchOrder("auto", `} elseif ($clickMethod -eq "auto") {`, `throw "Invalid click_method '$clickMethod'"`, "Send-MouseClick")
+
+	if !strings.Contains(windowsRuntimeScript, `$message -ne "Target changed; call get_app_state again." -and $message -ne "Click requires an element with a valid frame or explicit finite x/y coordinates."`) {
+		t.Fatal("click point errors must remain bounded at the PowerShell response boundary")
 	}
 }
 
@@ -582,6 +704,9 @@ func TestWindowsRuntimeForegroundActionsRequireOptIn(t *testing.T) {
 	}
 	if !strings.Contains(serverInstructions, "Global click and physical drag require both") {
 		t.Fatal("MCP instructions must document the separate global pointer authorization")
+	}
+	if !strings.Contains(serverInstructions, "Element-targeted coordinate fallback requires a valid finite snapshot frame or explicit finite x/y") {
+		t.Fatal("MCP instructions must document the missing-frame click boundary")
 	}
 	if !strings.Contains(serverInstructions, "`press_key` is rejected unless the foreground-input flag is set") {
 		t.Fatal("MCP instructions must document keyboard input authorization")
