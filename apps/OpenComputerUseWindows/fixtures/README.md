@@ -4,7 +4,7 @@ These disposable desktop fixtures provide observable targets for manual and MCP 
 
 ## Start
 
-Run either script with PowerShell 7 from an interactive desktop session:
+Run either fixture script with PowerShell 7 (or Windows PowerShell 5.1 where WPF/WinForms components are available) from an interactive desktop session:
 
 ```powershell
 pwsh.exe -NoProfile -ExecutionPolicy Bypass -File .\fixtures\wpf-test-bench.ps1
@@ -29,22 +29,27 @@ For deterministic smoke runs, both scripts accept `-InstanceName`, `-ReadyPath`,
 
 ## Native Fixture
 
-`native-pointer-bench.ps1` exposes a WinForms `BUTTON`, editable native text box, and `TrackBar`. The button reports `Click`, mouse-down, and mouse-up counters. The native `app_post` path uses the button's `BM_CLICK` message and should raise the `Click` counter without falling back to global input; the native text box verifies the focused child-HWND `type_text` path without UIA fallback authorization.
+`native-pointer-bench.ps1` exposes a WinForms `BUTTON`, editable native text box, and `TrackBar`. The button reports `Click`, mouse-down, and mouse-up counters. The native `app_post` path uses the button's `BM_CLICK` message and should raise the `Click` counter without falling back to global input; the native text box verifies the focused child-HWND `type_text` path without UIA fallback authorization, including appending to a pre-existing value.
 
 ## Repeatable Smoke
 
-Run the source-owned runner with PowerShell 7 from `apps/OpenComputerUseWindows`:
+Run the source-owned runner from `apps/OpenComputerUseWindows`:
 
 ```powershell
 pwsh.exe -NoProfile -ExecutionPolicy Bypass -File .\fixtures\run-interactive-smoke.ps1
 ```
 
-It launches two WPF instances and one WinForms instance, verifies identity-pinned A behavior, missing/empty/blank/null-member/non-numeric/fractional/both-sided-out-of-range element runtime IDs, and a synchronized same-metadata replacement surface for settable text controls. The runner proves the original runtime ID differs from both current duplicate settable-text records, writes each fresh duplicate independently, then verifies a stale old record is rejected before accessibility/app-post/global/auto click, secondary action, scroll, or `set_value` can mutate either replacement. The runner also proves focused WPF `type_text` success, non-editable/outside-window focus rejection, duplicate-control isolation, disabled UIA fallback rejection, and native focused child-HWND typing without the UIA fallback flag. It checks unchanged B state, mismatched identity, moved-window stale bounds, unauthorized global/keyboard rejection, WPF app-post capability handling, native `BM_CLICK`, and outside-window app-post rejection, then terminates all fixtures. Add `-KeepArtifacts` only when diagnosing a failed run.
+The runner itself is compatible with Windows PowerShell 5.1; by default it launches the WPF and WinForms fixtures with `pwsh.exe` and executes the embedded `runtime.ps1` with `powershell.exe` to exercise the runtime's 5.1 compatibility. Use `-FixtureHostPath` and `-RuntimeHostPath` to select the WPF/runtime executables, and `-NativeFixtureHostPath` to select the WinForms host separately. The native fixture defaults to `pwsh.exe` because the .NET Framework WinForms UIA provider used by Windows PowerShell 5.1 exposes its child controls as generic panes; this is a fixture-host limitation, not a runtime fallback. For the Windows PowerShell 5.1 runner/runtime boundary with native-HWND coverage, use `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\fixtures\run-interactive-smoke.ps1 -FixtureHostPath powershell.exe -RuntimeHostPath powershell.exe -NativeFixtureHostPath pwsh.exe`; the output records the runner version and each resolved host basename.
+
+It launches two WPF instances and one WinForms instance, verifies identity-pinned A behavior, rejects a pinned A record under B's selector, rejects missing/empty/blank/null-member/non-numeric/fractional/both-sided-out-of-range element runtime IDs, and exercises a synchronized same-metadata replacement surface for settable text controls. The runner proves the original runtime ID differs from both current duplicate settable-text records, writes each fresh duplicate independently, then verifies a stale old record is rejected before accessibility/app-post/global/auto click, secondary action, scroll, or `set_value` can mutate either replacement. The runner also proves focused WPF `type_text` success, non-editable/outside-window focus rejection, duplicate-control isolation, disabled UIA fallback rejection, and native focused child-HWND typing without the UIA fallback flag. It checks unchanged B state, mismatched identity, moved-window stale bounds, unauthorized global/keyboard rejection, WPF app-post capability handling, native `BM_CLICK`, outside-window app-post rejection, strict bounded runtime JSON/diagnostics, and timeout cleanup, then terminates all fixtures. Add `-KeepArtifacts` only when diagnosing a failed run.
 
 The Go integration test `TestWindowsFixtureIdentityAndBoundsSmoke` remains an additional request-propagation check and is explicitly opt-in with `$env:OPEN_COMPUTER_USE_RUN_WINDOWS_FIXTURE_SMOKE = '1'`.
 
-## Interactive Input Authorization
+## Public MCP Element Identifiers
 
+The Go/MCP route exposes each element as a generation-bound opaque `element_index` string (for example `s-0000000000000001:15`). Use the complete identifier from the latest `get_app_state`; every successful snapshot/action refresh publishes a new generation and expires the prior identifiers. Legacy bare numeric indices are rejected instead of being mapped to the current ordinal. The PowerShell fixture runner may still use its internal numeric `record.index` when it passes a full record directly to the embedded runtime; that is not the public MCP identifier. Windows `scroll.pages` accepts positive numbers up to 100; fractional values are preserved for one viewport-percent semantic operation or one app-scoped fallback message. A scroll timeout may mean that operation was already applied, so refresh with `get_app_state` before retrying.
+
+## Interactive Input Authorization
 The real pointer and keyboard paths are off by default. For a positive physical-input run, configure only the deliberate capabilities being tested:
 
 - `OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1` enables the repository-wide physical pointer gate.

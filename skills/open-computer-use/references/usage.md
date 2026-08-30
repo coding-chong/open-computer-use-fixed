@@ -27,7 +27,7 @@ Equivalent JSON shape:
 }
 ```
 
-The MCP server exposes:
+The common MCP server exposes:
 
 ```text
 list_apps
@@ -41,23 +41,25 @@ press_key
 set_value
 ```
 
+The Windows runtime additionally exposes `save_screenshot` for user-requested PNG export; it is not part of the common macOS/Linux list.
+
 ## Direct CLI Tool Calls
 
-Use `call` for one-off checks:
+Use `call` for one-off checks. On Windows, first copy the complete generation-bound opaque `element_index` identifier from the latest `get_app_state`; a bare numeric index is rejected after the token migration:
 
 ```sh
 open-computer-use call list_apps
 ocu call list_apps
 open-computer-use call get_app_state --args '{"app":"TextEdit"}'
-open-computer-use call set_value --args '{"app":"TextEdit","element_index":"1","value":"Draft"}'
+open-computer-use call set_value --args '{"app":"TextEdit","element_index":"<token-from-latest-get_app_state>","value":"Draft"}'
 ```
 
-Use `--calls` for short action sequences that need to reuse the same process state:
+Use `--calls` for short action sequences that need to reuse the same process state. Each element-targeted call must use the complete token returned by the immediately preceding snapshot, and an action refresh publishes new tokens:
 
 ```sh
 open-computer-use call --calls '[
   {"tool":"get_app_state","args":{"app":"TextEdit"}},
-  {"tool":"click","args":{"app":"TextEdit","element_index":"1"}},
+  {"tool":"click","args":{"app":"TextEdit","element_index":"<token-from-latest-get_app_state>"}},
   {"tool":"type_text","args":{"app":"TextEdit","text":"Hello"}}
 ]'
 ```
@@ -149,7 +151,11 @@ The macOS runtime uses Accessibility, ScreenCaptureKit, app-posted input events,
 
 The Windows runtime uses UI Automation and Win32 message fallbacks. It must run in a logged-in desktop session. A detached SSH or service context may start the CLI but fail to see top-level windows.
 
-Windows `type_text` is focus-only: click or select the intended writable text control first. At delivery time the runtime validates that the current focused UIA element belongs to the requested process and snapshot-bound window, then uses only that element; it never picks the first writable/current-tree match, implicitly focuses a control, sends global keyboard input, or falls back to a top-level HWND. Use `set_value` with `element_index` for exact element-indexed assignment. UIA `ValuePattern` text delivery remains explicitly gated by `OPEN_COMPUTER_USE_WINDOWS_ALLOW_UIA_TEXT_FALLBACK=1` when no usable child edit HWND exists.
+Windows element-targeted actions use a generation-bound opaque `element_index` string from the latest `get_app_state`; do not pass a bare numeric ordinal or reuse a token after an action refresh. The dispatcher retains the matching snapshot record and fails closed with `Target changed; call get_app_state again.` when the token is stale, unknown, malformed, or evicted.
+
+Windows `scroll.pages` accepts positive values up to 100. Semantic scrolling uses one viewport-percent operation; the message fallback uses one app-scoped wheel message and preserves fractional values. If scrolling times out, refresh with `get_app_state` before deciding whether to retry because the operation may already have been applied.
+
+Windows `type_text` is focus-only: click or select the intended writable text control first. At delivery time the runtime validates that the current focused UIA element belongs to the requested process and snapshot-bound window, then uses only that element; it never picks the first writable/current-tree match, implicitly focuses a control, sends global keyboard input, or falls back to a top-level HWND. On native edit controls, text is appended using an explicit end-of-value UTF-16 selection and postcondition check; a failed postcondition is not transactional rollback and is never replayed through another write path. Use `set_value` with the complete generation-bound identifier in `element_index` for exact element-indexed assignment. UIA `ValuePattern` text delivery remains explicitly gated by `OPEN_COMPUTER_USE_WINDOWS_ALLOW_UIA_TEXT_FALLBACK=1` when no usable child edit HWND exists.
 
 ### Linux
 

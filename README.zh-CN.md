@@ -127,7 +127,7 @@ open-computer-use call list_apps
 ocu call list_apps
 open-computer-use call get_app_state --args '{"app":"TextEdit"}'
 
-# 在同一个进程里编排连续动作，复用 get_app_state 拿到的 element_index
+# 在同一个进程里编排连续动作；Windows 的 element_index 是带快照代次的标识，刷新后旧标识会失效
 # 连续动作默认会在成功的相邻操作之间 sleep 1 秒
 open-computer-use call --calls '[{"tool":"get_app_state","args":{"app":"TextEdit"}},{"tool":"press_key","args":{"app":"TextEdit","key":"Return"}}]'
 open-computer-use call --calls-file examples/textedit-overlay-seq.json --sleep 0.5

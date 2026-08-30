@@ -80,7 +80,7 @@ Increasing the tree budget does not change text truncation, screenshot limits, p
 If an element-targeted action fails:
 
 1. Re-run `get_app_state`.
-2. Confirm the `element_index` still exists and refers to the intended UI element.
+2. Confirm the complete generation-bound `element_index` token still exists and refers to the intended UI element; a bare numeric ordinal or a token from an older action result is intentionally rejected.
 3. Prefer `set_value` for settable text/value controls.
 4. Prefer `perform_secondary_action` only for actions exposed in the state result.
 5. Use coordinate `click`, `scroll`, or `drag` only after the semantic route is unavailable.

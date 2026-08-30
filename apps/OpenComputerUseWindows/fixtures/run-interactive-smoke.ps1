@@ -1,5 +1,8 @@
 param(
-    [switch]$KeepArtifacts
+    [switch]$KeepArtifacts,
+    [string]$FixtureHostPath = 'pwsh.exe',
+    [string]$RuntimeHostPath = 'powershell.exe',
+    [string]$NativeFixtureHostPath = 'pwsh.exe'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -8,6 +11,43 @@ $runtimePath = Join-Path (Split-Path -Parent $fixtureRoot) 'runtime.ps1'
 $runRoot = Join-Path $env:TEMP ('ocu-windows-smoke-' + $PID)
 $fixtures = New-Object System.Collections.Generic.List[object]
 $operationNumber = 0
+$runtimeTimeoutMilliseconds = 30000
+$runtimeOutputLimit = 1048576
+$focusedSuccessText = -join ([char[]]@(0x7126, 0x70B9, 0x6210, 0x529F, 0x2705))
+$duplicateSuccessText = -join ([char[]]@(0x91CD, 0x590D, 0x6210, 0x529F, 0x2705))
+$nativeSuccessText = -join ([char[]]@(0x539F, 0x751F, 0x6210, 0x529F, 0x2705))
+
+function Resolve-HostExecutable([string]$candidate) {
+    try {
+        $command = Get-Command -Name $candidate -CommandType Application -ErrorAction Stop
+        if ($null -ne $command.Source -and -not [string]::IsNullOrWhiteSpace([string]$command.Source)) {
+            return [string]$command.Source
+        }
+        return [string]$command.Path
+    } catch {
+        throw 'Required PowerShell host executable was not found.'
+    }
+}
+
+function ConvertTo-WindowsProcessArgument([string]$value) {
+    if ($value -notmatch '[\s"]') {
+        return $value
+    }
+    $escaped = $value -replace '(\\*)"', '$1$1\"'
+    $escaped = $escaped -replace '(\\+)$', '$1$1'
+    return '"' + $escaped + '"'
+}
+
+function Set-ProcessArguments($startInfo, [string[]]$arguments) {
+    $argumentListProperty = $startInfo.PSObject.Properties['ArgumentList']
+    if ($null -ne $argumentListProperty) {
+        foreach ($argument in $arguments) {
+            [void]$startInfo.ArgumentList.Add($argument)
+        }
+        return
+    }
+    $startInfo.Arguments = (($arguments | ForEach-Object { ConvertTo-WindowsProcessArgument ([string]$_) }) -join ' ')
+}
 
 function Assert-Condition([bool]$condition, [string]$message) {
     if (-not $condition) {
@@ -28,12 +68,38 @@ function Test-MissingClickFrameResponse($response) {
 }
 
 function Test-TypeTextTargetResponse($response) {
-    return ($null -ne $response -and -not $response.ok -and $response.error -eq 'type_text requires a focused writable text control owned by the requested app/window; click/select the field first or use set_value with element_index.')
+    return ($null -ne $response -and -not $response.ok -and $response.error -eq 'type_text requires a focused writable text control owned by the requested app/window; click/select the field first or use set_value with the complete generation-bound identifier in element_index.')
 }
 
 function Test-TypeTextFallbackResponse($response) {
-    return ($null -ne $response -and -not $response.ok -and $response.error -eq 'The focused text control has no usable native edit handle; UIA ValuePattern text fallback is disabled by default; set OPEN_COMPUTER_USE_WINDOWS_ALLOW_UIA_TEXT_FALLBACK=1 or use set_value with element_index.')
+    return ($null -ne $response -and -not $response.ok -and $response.error -eq 'The focused text control has no usable native edit handle; UIA ValuePattern text fallback is disabled by default; set OPEN_COMPUTER_USE_WINDOWS_ALLOW_UIA_TEXT_FALLBACK=1 or use set_value with the complete generation-bound identifier in element_index.')
 }
+
+function Test-BoundedPngResponse($response) {
+    if ($null -eq $response -or -not $response.ok) {
+        return $false
+    }
+    $payload = [string]$response.snapshot.screenshotPngBase64
+    if ([string]::IsNullOrWhiteSpace($payload)) {
+        # Omission is the safe result when target ownership cannot be proven.
+        return $true
+    }
+    try {
+        $bytes = [Convert]::FromBase64String($payload)
+        return ($bytes.Length -ge 8 -and $bytes[0] -eq 137 -and $bytes[1] -eq 80 -and $bytes[2] -eq 78 -and $bytes[3] -eq 71 -and $bytes[4] -eq 13 -and $bytes[5] -eq 10 -and $bytes[6] -eq 26 -and $bytes[7] -eq 10)
+    } catch {
+        return $false
+    }
+}
+
+function Test-BoundedRuntimeErrorResponse($response) {
+    return (
+        $null -ne $response -and -not $response.ok -and
+        -not [string]::IsNullOrWhiteSpace([string]$response.error) -and
+        [string]$response.error -notmatch 'runtime\.ps1|ScriptStackTrace|line [0-9]+|operation-[0-9]+\.json'
+    )
+}
+
 
 function Test-SameFixtureActionState($before, $after) {
     return (
@@ -52,10 +118,18 @@ function Test-SameFixtureActionState($before, $after) {
 }
 
 function Read-State([string]$path) {
-    return (Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json)
+    for ($attempt = 0; $attempt -lt 5; $attempt++) {
+        try {
+            $json = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
+            return ($json | ConvertFrom-Json -ErrorAction Stop)
+        } catch {
+            Start-Sleep -Milliseconds 25
+        }
+    }
+    throw 'Fixture state could not be read consistently.'
 }
 
-function Start-Fixture([string]$scriptName, [string]$instance, [int]$left, [int]$top) {
+function Start-Fixture([string]$scriptName, [string]$instance, [int]$left, [int]$top, [string]$hostPath) {
     $readyPath = Join-Path $runRoot ($instance + '-ready.json')
     $statePath = Join-Path $runRoot ($instance + '-state.json')
     $scriptPath = Join-Path $fixtureRoot $scriptName
@@ -70,12 +144,10 @@ function Start-Fixture([string]$scriptName, [string]$instance, [int]$left, [int]
         '-Top', [string]$top
     )
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
-    $startInfo.FileName = 'pwsh.exe'
+    $startInfo.FileName = $hostPath
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
-    foreach ($argument in $arguments) {
-        [void]$startInfo.ArgumentList.Add($argument)
-    }
+    Set-ProcessArguments $startInfo $arguments
     $process = [System.Diagnostics.Process]::Start($startInfo)
     Assert-Condition ($null -ne $process) ('Could not start fixture ' + $instance)
     $target = [pscustomobject]@{
@@ -94,8 +166,14 @@ function Wait-FixtureReady($target) {
         if ((Test-Path -LiteralPath $target.ReadyPath) -and (Test-Path -LiteralPath $target.StatePath)) {
             try {
                 $state = Read-State $target.StatePath
-                if ($state.ready -and $state.pid -gt 0 -and $state.hwnd -ne 0) {
-                    return $state
+                if ($state.ready -and $state.instance -eq $target.Instance -and $state.pid -gt 0 -and $state.hwnd -ne 0 -and -not [string]::IsNullOrWhiteSpace([string]$state.title)) {
+                    try {
+                        $process = Get-Process -Id ([int]$state.pid) -ErrorAction Stop
+                        if ([int64]$process.MainWindowHandle -eq [int64]$state.hwnd) {
+                            return $state
+                        }
+                    } catch {
+                    }
                 }
             } catch {
             }
@@ -108,19 +186,66 @@ function Wait-FixtureReady($target) {
 function Invoke-Runtime($operation) {
     $script:operationNumber += 1
     $operationPath = Join-Path $runRoot ('operation-' + $script:operationNumber + '.json')
-    $operation | ConvertTo-Json -Depth 50 -Compress | Set-Content -LiteralPath $operationPath -Encoding utf8
-    $output = & pwsh.exe -NoProfile -ExecutionPolicy Bypass -File $runtimePath $operationPath
-    if ($LASTEXITCODE -ne 0) {
-        throw ('runtime process failed: ' + ($output -join "`n"))
+    $operationJson = $operation | ConvertTo-Json -Depth 50 -Compress
+    Set-Content -LiteralPath $operationPath -Value $operationJson -Encoding utf8
+
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $script:RuntimeHostPathResolved
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+    $startInfo.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+    Set-ProcessArguments $startInfo @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $runtimePath, $operationPath)
+
+    $process = $null
+    try {
+        try {
+            $process = [System.Diagnostics.Process]::Start($startInfo)
+        } catch {
+            throw 'Could not start the Windows runtime process.'
+        }
+        Assert-Condition ($null -ne $process) 'Could not start the Windows runtime process.'
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit($runtimeTimeoutMilliseconds)) {
+            try { [void]$process.Kill() } catch { }
+            try { [void]$process.WaitForExit(5000) } catch { }
+            throw 'Windows runtime process timed out.'
+        }
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        if ($process.ExitCode -ne 0) {
+            throw 'Windows runtime process failed.'
+        }
+        if ($stdout.Length -gt $runtimeOutputLimit -or $stderr.Length -gt $runtimeOutputLimit) {
+            throw 'Windows runtime output exceeded the safety limit.'
+        }
+        if ([string]::IsNullOrWhiteSpace($stdout)) {
+            throw 'Windows runtime returned no response.'
+        }
+        try {
+            $response = $stdout | ConvertFrom-Json -ErrorAction Stop
+        } catch {
+            throw 'Windows runtime returned invalid JSON.'
+        }
+        if ($null -eq $response -or $response -is [System.Array]) {
+            throw 'Windows runtime returned an invalid response object.'
+        }
+        return $response
+    } finally {
+        if ($null -ne $process) {
+            $process.Dispose()
+        }
     }
-    return (($output -join "`n") | ConvertFrom-Json)
 }
 
-function Get-Snapshot([string]$title) {
+function Get-Snapshot([string]$title, [bool]$includeImage = $false) {
     $response = Invoke-Runtime ([pscustomobject]@{
         tool = 'get_app_state'
         app = $title
-        include_image = $false
+        include_image = $includeImage
         text_limit = 250
         max_tree_nodes = 180
         max_tree_depth = 16
@@ -282,12 +407,15 @@ function Restore-ProcessEnvironment($saved, [string[]]$names) {
 }
 
 try {
+    $script:FixtureHostPathResolved = Resolve-HostExecutable $FixtureHostPath
+    $script:RuntimeHostPathResolved = Resolve-HostExecutable $RuntimeHostPath
+    $script:NativeFixtureHostPathResolved = Resolve-HostExecutable $NativeFixtureHostPath
     Add-Type -AssemblyName UIAutomationClient
     Add-Type -AssemblyName UIAutomationTypes
     New-Item -ItemType Directory -Path $runRoot -Force | Out-Null
-    $targetA = Start-Fixture 'wpf-test-bench.ps1' 'A' 20 20
-    $targetB = Start-Fixture 'wpf-test-bench.ps1' 'B' 1280 20
-    $nativeTarget = Start-Fixture 'native-pointer-bench.ps1' 'N' 40 900
+    $targetA = Start-Fixture 'wpf-test-bench.ps1' 'A' 20 20 $script:FixtureHostPathResolved
+    $targetB = Start-Fixture 'wpf-test-bench.ps1' 'B' 1280 20 $script:FixtureHostPathResolved
+    $nativeTarget = Start-Fixture 'native-pointer-bench.ps1' 'N' 40 900 $script:NativeFixtureHostPathResolved
     $stateA = Wait-FixtureReady $targetA
     $stateB = Wait-FixtureReady $targetB
     $nativeState = Wait-FixtureReady $nativeTarget
@@ -297,8 +425,56 @@ try {
     $nativeSnapshot = Get-Snapshot $nativeState.title
     Assert-Condition ($snapshotA.app.pid -ne $snapshotB.app.pid -and $snapshotA.app.mainWindowHandle -ne $snapshotB.app.mainWindowHandle) 'A and B did not receive distinct identities.'
 
-    $setElementA = Find-Element $snapshotA 'Set value target' 'SetValue' $false
-    Assert-Condition ($null -ne $setElementA) 'The settable A TextBox was not found.'
+    $screenshotResponse = Invoke-Runtime ([pscustomobject]@{
+        tool = 'get_app_state'; app = $stateA.title; include_image = $true; text_limit = 250; max_tree_nodes = 180; max_tree_depth = 16
+    })
+    $screenshotCaptureBounded = Test-BoundedPngResponse $screenshotResponse
+    Assert-Condition $screenshotCaptureBounded 'Screenshot response was neither a valid PNG nor a safely omitted image.'
+
+    $identityBaselineForValidation = Read-State $targetA.StatePath
+    $identityValidationPassed = $true
+    $identityCases = @(
+        [pscustomobject]@{ tool = 'get_app_state'; app = $stateA.title; expectedPid = [int]$snapshotA.app.pid },
+        [pscustomobject]@{ tool = 'get_app_state'; app = $stateA.title; expectedPid = 'not-a-pid'; expectedProcessStartTimeTicks = [int64]$snapshotA.app.processStartTimeTicks; expectedMainWindowHandle = [int64]$snapshotA.app.mainWindowHandle },
+        [pscustomobject]@{ tool = 'get_app_state'; app = $stateA.title; expectedPid = [int]$snapshotA.app.pid; expectedProcessStartTimeTicks = $null; expectedMainWindowHandle = [int64]$snapshotA.app.mainWindowHandle },
+        [pscustomobject]@{ tool = 'get_app_state'; app = $stateA.title; expectedPid = 1.5; expectedProcessStartTimeTicks = [int64]$snapshotA.app.processStartTimeTicks; expectedMainWindowHandle = [int64]$snapshotA.app.mainWindowHandle }
+    )
+    foreach ($identityCase in $identityCases) {
+        $identityResponse = Invoke-Runtime $identityCase
+        if (-not (Test-TargetChangedResponse $identityResponse)) {
+            $identityValidationPassed = $false
+            break
+        }
+    }
+    $identityAfterValidation = Read-State $targetA.StatePath
+    $identityValidationPassed = $identityValidationPassed -and (Test-SameFixtureActionState $identityBaselineForValidation $identityAfterValidation)
+    Assert-Condition $identityValidationPassed 'Malformed or partial pinned get_app_state identity was not rejected fail-closed.'
+
+    $numericBaseline = Read-State $targetA.StatePath
+    $numericOperations = @(
+        [pscustomobject]@{ tool = 'click'; app = $stateA.title; click_count = 1.5 },
+        [pscustomobject]@{ tool = 'click'; app = $stateA.title; click_count = $null },
+        [pscustomobject]@{ tool = 'click'; app = $stateA.title; x = 1; y = $null },
+        [pscustomobject]@{ tool = 'scroll'; app = $stateA.title; pages = 0.5 },
+        [pscustomobject]@{ tool = 'scroll'; app = $stateA.title; pages = $null },
+        [pscustomobject]@{ tool = 'scroll'; app = $stateA.title; pages = 'not-a-number' },
+        [pscustomobject]@{ tool = 'click'; app = $stateA.title; click_count = 0 },
+        [pscustomobject]@{ tool = 'click'; app = $stateA.title; x = 2000000000; y = 2000000000 },
+        [pscustomobject]@{ tool = 'scroll'; app = $stateA.title; pages = 0 },
+        [pscustomobject]@{ tool = 'scroll'; app = $stateA.title; pages = 101 }
+    )
+    $numericValidationPassed = $true
+    foreach ($numericOperation in $numericOperations) {
+        $numericResponse = Invoke-Runtime $numericOperation
+        if (-not (Test-BoundedRuntimeErrorResponse $numericResponse)) {
+            $numericValidationPassed = $false
+            break
+        }
+    }
+    $numericAfter = Read-State $targetA.StatePath
+    $numericValidationPassed = $numericValidationPassed -and (Test-SameFixtureActionState $numericBaseline $numericAfter)
+    Assert-Condition $numericValidationPassed 'Invalid numeric operations were not rejected before fixture delivery or leaked diagnostics.'
+
     $identityElementA = Find-Element $snapshotA 'Identity replacement target' 'SetValue' $false
     Assert-Condition ($null -ne $identityElementA) 'The identity replacement target was not found.'
     $replaceIdentityElementA = Find-Element $snapshotA 'Replace identity target' 'Invoke' $false
@@ -510,28 +686,28 @@ try {
     $afterStaleElement = Read-State $targetA.StatePath
     Assert-Condition ($afterStaleElement.identityPrimaryValue -eq $addressedPrimaryValue -and $afterStaleElement.identityDuplicateValue -eq $addressedDuplicateValue -and $afterStaleElement.identityReplacementCount -eq 1) 'A stale element action changed a replacement or duplicate target.'
 
+    $baselineCrossA = Read-State $targetA.StatePath
     $baselineB = Read-State $targetB.StatePath
     $crossQuery = [pscustomobject]@{
         tool = 'set_value'
         app = $stateB.title
-        element = $setElementA
-        value = 'cross-query-A'
+        element = $replacementPrimaryElement
+        value = 'must-not-cross-query'
         expectedPid = [int]$snapshotA.app.pid
         expectedProcessStartTimeTicks = [int64]$snapshotA.app.processStartTimeTicks
         expectedMainWindowHandle = [int64]$snapshotA.app.mainWindowHandle
     }
     $crossResult = Invoke-Runtime $crossQuery
-    Assert-Condition $crossResult.ok ('Identity-pinned A action failed: ' + $crossResult.error)
+    Assert-TargetChangedResponse $crossResult 'A pinned identity was accepted under a different app selector.'
     Start-Sleep -Milliseconds 200
     $afterCrossA = Read-State $targetA.StatePath
     $afterCrossB = Read-State $targetB.StatePath
-    Assert-Condition ($afterCrossA.setValue -eq 'cross-query-A') 'A did not receive the identity-pinned set_value.'
-    Assert-Condition ($afterCrossB.setValue -eq $baselineB.setValue) 'B changed during the identity-pinned A action.'
+    Assert-Condition ($afterCrossA.setValue -eq $baselineCrossA.setValue -and $afterCrossB.setValue -eq $baselineB.setValue) 'A cross-query pinned action changed a fixture.'
 
     $badIdentity = [pscustomobject]@{
         tool = 'set_value'
         app = $stateB.title
-        element = $setElementA
+        element = $replacementPrimaryElement
         value = 'must-not-write'
         expectedPid = [int]$snapshotB.app.pid
         expectedProcessStartTimeTicks = [int64]$snapshotA.app.processStartTimeTicks
@@ -597,15 +773,15 @@ try {
         $beforeFocusedTypeText = Read-State $targetA.StatePath
         $focusedType = Set-FixtureFocus $stateA.hwnd 'Type text target' 'ControlType.Edit' ''
         Assert-Condition ($focusedType.processId -eq $snapshotA.app.pid) 'The WPF type_text target focus escaped the requested process.'
-        $focusedTypeTextResponse = Invoke-TypeText $stateA $snapshotA '焦点成功-✅'
+        $focusedTypeTextResponse = Invoke-TypeText $stateA $snapshotA $focusedSuccessText
         Assert-Condition $focusedTypeTextResponse.ok ('Focused WPF type_text failed: ' + $focusedTypeTextResponse.error)
         $afterFocusedTypeText = Wait-FixtureStateCondition $targetA {
             param($state)
-            return $state.typed -eq ($beforeFocusedTypeText.typed + '焦点成功-✅')
+            return $state.typed -eq ($beforeFocusedTypeText.typed + $focusedSuccessText)
         } 'focused WPF type_text'
         $focusedTypeTextAccepted = (
             $focusedTypeTextResponse.ok -and
-            $afterFocusedTypeText.typed -eq ($beforeFocusedTypeText.typed + '焦点成功-✅') -and
+            $afterFocusedTypeText.typed -eq ($beforeFocusedTypeText.typed + $focusedSuccessText) -and
             $afterFocusedTypeText.identityPrimaryValue -eq $beforeFocusedTypeText.identityPrimaryValue -and
             $afterFocusedTypeText.identityDuplicateValue -eq $beforeFocusedTypeText.identityDuplicateValue
         )
@@ -638,16 +814,16 @@ try {
         Assert-Condition ($null -ne $duplicateTypeTextRecord) 'The duplicate focused type_text target was not found.'
         $focusDuplicateForTypeText = Set-FixtureFocus $stateA.hwnd 'Identity replacement target' 'ControlType.Edit' 'identity-duplicate-'
         $beforeDuplicateTypeText = Read-State $targetA.StatePath
-        $duplicateTypeTextResponse = Invoke-TypeText $stateA $snapshotA '重复成功-✅'
+        $duplicateTypeTextResponse = Invoke-TypeText $stateA $snapshotA $duplicateSuccessText
         Assert-Condition $duplicateTypeTextResponse.ok ('Focused duplicate WPF type_text failed: ' + $duplicateTypeTextResponse.error)
         $afterDuplicateTypeText = Wait-FixtureStateCondition $targetA {
             param($state)
-            return $state.identityDuplicateValue -eq ($beforeDuplicateTypeText.identityDuplicateValue + '重复成功-✅')
+            return $state.identityDuplicateValue -eq ($beforeDuplicateTypeText.identityDuplicateValue + $duplicateSuccessText)
         } 'focused duplicate WPF type_text'
         $duplicateFocusedTypeTextIsolated = (
             $duplicateTypeTextResponse.ok -and
             $afterDuplicateTypeText.identityPrimaryValue -eq $beforeDuplicateTypeText.identityPrimaryValue -and
-            $afterDuplicateTypeText.identityDuplicateValue -eq ($beforeDuplicateTypeText.identityDuplicateValue + '重复成功-✅') -and
+            $afterDuplicateTypeText.identityDuplicateValue -eq ($beforeDuplicateTypeText.identityDuplicateValue + $duplicateSuccessText) -and
             $afterDuplicateTypeText.typed -eq $beforeDuplicateTypeText.typed
         )
         Assert-Condition $duplicateFocusedTypeTextIsolated 'Focused duplicate type_text did not stay on the focused control.'
@@ -693,22 +869,33 @@ try {
 
         $nativeTypeElement = Find-Element $nativeSnapshot 'Native type_text target' 'SetValue' $true
         Assert-Condition ($null -ne $nativeTypeElement) 'The native type_text target was not found with a child HWND.'
+        $nativeSeedValue = 'native-seed-'
+        $nativeSeedResult = Invoke-Runtime ([pscustomobject]@{
+            tool = 'set_value'; app = $nativeState.title; element = $nativeTypeElement; value = $nativeSeedValue
+            expectedPid = [int]$nativeSnapshot.app.pid; expectedProcessStartTimeTicks = [int64]$nativeSnapshot.app.processStartTimeTicks
+            expectedMainWindowHandle = [int64]$nativeSnapshot.app.mainWindowHandle
+        })
+        Assert-Condition $nativeSeedResult.ok ('Native type_text seed failed: ' + $nativeSeedResult.error)
+        $nativeSnapshot = $nativeSeedResult.snapshot
+        $nativeTypeElement = Find-Element $nativeSnapshot 'Native type_text target' 'SetValue' $true
+        Assert-Condition ($null -ne $nativeTypeElement) 'The native type_text target disappeared after seeding.'
         $focusNativeTypeText = Set-FixtureFocus $nativeState.hwnd 'Native type_text target' 'ControlType.Edit' ''
         $savedFallbackForNativeTest = [Environment]::GetEnvironmentVariable($typeTextEnvironmentName)
         try {
             [Environment]::SetEnvironmentVariable($typeTextEnvironmentName, $null)
             $beforeNativeTypeText = Read-State $nativeTarget.StatePath
-            $nativeTypeTextResponse = Invoke-TypeText $nativeState $nativeSnapshot '原生成功-✅'
+            Assert-Condition ($beforeNativeTypeText.typed -eq $nativeSeedValue) 'Native type_text seed did not stabilize before typing.'
+            $nativeTypeTextResponse = Invoke-TypeText $nativeState $nativeSnapshot $nativeSuccessText
             Assert-Condition $nativeTypeTextResponse.ok ('Native child-HWND type_text failed: ' + $nativeTypeTextResponse.error)
             $afterNativeTypeText = Wait-FixtureStateCondition $nativeTarget {
                 param($state)
-                return $state.typed -eq ($beforeNativeTypeText.typed + '原生成功-✅')
-            } 'native child-HWND type_text'
+                return $state.typed -eq ($beforeNativeTypeText.typed + $nativeSuccessText)
+            } 'native child-HWND type_text append'
             $nativeFocusedTypeTextAccepted = (
                 $nativeTypeTextResponse.ok -and
-                $afterNativeTypeText.typed -eq ($beforeNativeTypeText.typed + '原生成功-✅')
+                $afterNativeTypeText.typed -eq ($beforeNativeTypeText.typed + $nativeSuccessText)
             )
-            Assert-Condition $nativeFocusedTypeTextAccepted 'Native child-HWND type_text did not update its intended field.'
+            Assert-Condition $nativeFocusedTypeTextAccepted 'Native child-HWND type_text did not append to its intended field.'
         } finally {
             if ($null -eq $savedFallbackForNativeTest) {
                 Remove-Item -LiteralPath ('Env:' + $typeTextEnvironmentName) -ErrorAction SilentlyContinue
@@ -789,7 +976,7 @@ try {
     $semanticScrollWithoutFrame.frame = $null
     $beforeSemanticScroll = Read-State $targetA.StatePath
     $semanticScrollResult = Invoke-Runtime ([pscustomobject]@{
-        tool = 'scroll'; app = $stateA.title; element = $semanticScrollWithoutFrame; direction = 'down'; pages = 1
+        tool = 'scroll'; app = $stateA.title; element = $semanticScrollWithoutFrame; direction = 'down'; pages = 0.5
         windowBounds = $snapshotA.windowBounds; expectedPid = [int]$snapshotA.app.pid
         expectedProcessStartTimeTicks = [int64]$snapshotA.app.processStartTimeTicks; expectedMainWindowHandle = [int64]$snapshotA.app.mainWindowHandle
     })
@@ -802,7 +989,7 @@ try {
     Assert-Condition ($null -ne $scrollFallbackElement -and $null -ne $scrollFallbackElement.frame) 'The fallback scroll target was not found with a frame.'
     Assert-Condition (-not ($scrollFallbackElement.actions -contains 'Scroll')) 'The fallback scroll target unexpectedly exposes ScrollPattern.'
     $validFallbackResult = Invoke-Runtime ([pscustomobject]@{
-        tool = 'scroll'; app = $stateA.title; element = $scrollFallbackElement; direction = 'down'; pages = 1
+        tool = 'scroll'; app = $stateA.title; element = $scrollFallbackElement; direction = 'down'; pages = 0.5
         windowBounds = $snapshotA.windowBounds; expectedPid = [int]$snapshotA.app.pid
         expectedProcessStartTimeTicks = [int64]$snapshotA.app.processStartTimeTicks; expectedMainWindowHandle = [int64]$snapshotA.app.mainWindowHandle
     })
@@ -948,8 +1135,14 @@ try {
         $nativeAfterExplicitCoordinate.buttonUp -eq 0
     )
     $identityPinned = (
-        $crossResult.ok -and
-        $afterCrossA.setValue -eq 'cross-query-A' -and
+        $addressedPrimaryResult.ok -and
+        $addressedDuplicateResult.ok -and
+        $afterAddressedDuplicate.identityPrimaryValue -eq $addressedPrimaryValue -and
+        $afterAddressedDuplicate.identityDuplicateValue -eq $addressedDuplicateValue
+    )
+    $crossQueryRejected = (
+        (Test-TargetChangedResponse $crossResult) -and
+        $afterCrossA.setValue -eq $baselineCrossA.setValue -and
         $afterCrossB.setValue -eq $baselineB.setValue
     )
     $mismatchRejected = (
@@ -1033,6 +1226,10 @@ try {
     )
     $allReportedChecksPassed = @(
         $identityPinned,
+        $crossQueryRejected,
+        $screenshotCaptureBounded,
+        $identityValidationPassed,
+        $numericValidationPassed,
         $mismatchRejected,
         $staleBoundsRejected,
         $focusedTypeTextAccepted,
@@ -1067,7 +1264,15 @@ try {
     }
     [pscustomobject]@{
         ok = $allReportedChecksPassed
+        runnerPowerShell = [string]$PSVersionTable.PSVersion
+        fixtureHost = [System.IO.Path]::GetFileName($script:FixtureHostPathResolved)
+        runtimeHost = [System.IO.Path]::GetFileName($script:RuntimeHostPathResolved)
+        nativeFixtureHost = [System.IO.Path]::GetFileName($script:NativeFixtureHostPathResolved)
         identityPinned = $identityPinned
+        crossQueryRejected = $crossQueryRejected
+        screenshotCaptureBounded = $screenshotCaptureBounded
+        identityValidationPassed = $identityValidationPassed
+        numericValidationPassed = $numericValidationPassed
         mismatchRejected = $mismatchRejected
         staleBoundsRejected = $staleBoundsRejected
         focusedTypeTextAccepted = $focusedTypeTextAccepted

@@ -77,6 +77,7 @@ func TestWindowsFixtureIdentityAndBoundsSmoke(t *testing.T) {
 	if stateA.PID == stateB.PID || stateA.HWND == stateB.HWND {
 		t.Fatalf("fixtures did not receive distinct identities: A=%+v B=%+v", stateA, stateB)
 	}
+	baselineA := *stateA
 	baselineB := *stateB
 
 	svc := newService()
@@ -93,7 +94,7 @@ func TestWindowsFixtureIdentityAndBoundsSmoke(t *testing.T) {
 		t.Fatal("set value element missing from A snapshot")
 	}
 
-	// The mutable app selector names B, but the immutable identity names A.
+	// A mutable app selector must not override the pinned identity.
 	crossQuery := psRequest{
 		Tool:                     "set_value",
 		App:                      stateB.Title,
@@ -103,17 +104,32 @@ func TestWindowsFixtureIdentityAndBoundsSmoke(t *testing.T) {
 		ExpectedStartTimeTicks:   snapshotA.App.ProcessStartTimeTicks,
 		ExpectedMainWindowHandle: snapshotA.App.MainWindowHandle,
 	}
-	response, err := runPowerShell(crossQuery)
+	crossResponse, crossErr := runPowerShell(crossQuery)
+	if crossErr != nil {
+		t.Fatal(crossErr)
+	}
+	if crossResponse.OK || !strings.Contains(crossResponse.Error, "Target changed; call get_app_state again.") {
+		t.Fatalf("cross-selector pinned action was not rejected: %+v", crossResponse)
+	}
+	stateAAfterCross := readFixtureState(t, filepath.Join(runDir, "A-state.json"))
+	stateBAfterCross := readFixtureState(t, filepath.Join(runDir, "B-state.json"))
+	if !sameFixtureObservableState(&baselineA, stateAAfterCross) || !sameFixtureObservableState(&baselineB, stateBAfterCross) {
+		t.Fatalf("cross-selector action changed fixture state: A=%+v B=%+v", stateAAfterCross, stateBAfterCross)
+	}
+
+	pinnedAction := crossQuery
+	pinnedAction.App = stateA.Title
+	response, err := runPowerShell(pinnedAction)
 	if err != nil || !response.OK {
-		t.Fatalf("identity-pinned cross-query action failed: err=%v response=%+v", err, response)
+		t.Fatalf("identity-pinned action failed: err=%v response=%+v", err, response)
 	}
 	stateA = waitForFixtureValue(t, filepath.Join(runDir, "A-state.json"), func(state fixtureState) bool { return state.SetValue == "identity-pinned-a" })
 	stateB = readFixtureState(t, filepath.Join(runDir, "B-state.json"))
 	if stateB.SetValue != baselineB.SetValue {
-		t.Fatalf("cross-query action changed B: before=%+v after=%+v", baselineB, stateB)
+		t.Fatalf("pinned action changed B: before=%+v after=%+v", baselineB, stateB)
 	}
 
-	badIdentity := crossQuery
+	badIdentity := pinnedAction
 	badIdentity.ExpectedPID = stateB.PID
 	badIdentity.ExpectedStartTimeTicks = snapshotA.App.ProcessStartTimeTicks
 	badResponse, badErr := runPowerShell(badIdentity)
@@ -188,6 +204,41 @@ func TestWindowsFixtureIdentityAndBoundsSmoke(t *testing.T) {
 	if staleResponse.OK || !strings.Contains(staleResponse.Error, "Target changed; call get_app_state again.") {
 		t.Fatalf("stale bounds were not rejected: %+v", staleResponse)
 	}
+
+	// Public MCP identifiers must expire when the dispatcher publishes a replacement snapshot.
+	publicSnapshot := svc.currentSnapshot(stateA.Title)
+	publicSetRecord := findFixtureElement(publicSnapshot, "Set value target")
+	replaceRecord := findFixtureActionElement(publicSnapshot, "Replace identity target", "Invoke")
+	if publicSetRecord == nil || replaceRecord == nil || publicSetRecord.publicRef == "" || replaceRecord.publicRef == "" {
+		t.Fatalf("public token fixture records missing: set=%+v replace=%+v", publicSetRecord, replaceRecord)
+	}
+	oldPublicReference := publicSetRecord.publicRef
+	beforePublicReplacement := readFixtureState(t, filepath.Join(runDir, "A-state.json"))
+	replaceResult := svc.performSecondaryAction(stateA.Title, replaceRecord.publicRef, "Invoke")
+	if replaceResult.IsError {
+		t.Fatalf("public replacement action failed: %s", replaceResult.Content[0].Text)
+	}
+	stalePublicResult := svc.setValue(stateA.Title, oldPublicReference, "must-not-write")
+	if !stalePublicResult.IsError || len(stalePublicResult.Content) == 0 || stalePublicResult.Content[0].Text != targetChangedMessage {
+		t.Fatalf("stale public element reference result = %+v, want bounded target change", stalePublicResult)
+	}
+	afterStalePublic := readFixtureState(t, filepath.Join(runDir, "A-state.json"))
+	if !sameFixtureObservableState(beforePublicReplacement, afterStalePublic) {
+		t.Fatalf("stale public reference changed fixture state: before=%+v after=%+v", beforePublicReplacement, afterStalePublic)
+	}
+	freshPublicSnapshot := svc.currentSnapshot(stateA.Title)
+	freshPublicRecord := findFixtureElement(freshPublicSnapshot, "Set value target")
+	if freshPublicRecord == nil || freshPublicRecord.publicRef == "" || freshPublicRecord.publicRef == oldPublicReference {
+		t.Fatalf("fresh public element reference missing or reused: old=%q fresh=%+v", oldPublicReference, freshPublicRecord)
+	}
+	freshPublicResult := svc.setValue(stateA.Title, freshPublicRecord.publicRef, "fresh-public-write")
+	if freshPublicResult.IsError {
+		t.Fatalf("fresh public element reference failed: %s", freshPublicResult.Content[0].Text)
+	}
+	freshPublicState := waitForFixtureValue(t, filepath.Join(runDir, "A-state.json"), func(state fixtureState) bool { return state.SetValue == "fresh-public-write" })
+	if freshPublicState.SetValue != "fresh-public-write" {
+		t.Fatalf("fresh public reference did not update replacement: %+v", freshPublicState)
+	}
 }
 
 func findFixtureElement(snapshot *appSnapshot, name string) *elementRecord {
@@ -207,6 +258,25 @@ func findFixtureElement(snapshot *appSnapshot, name string) *elementRecord {
 		}
 		copy := record
 		return &copy
+	}
+	return nil
+}
+
+func findFixtureActionElement(snapshot *appSnapshot, name, action string) *elementRecord {
+	if snapshot == nil {
+		return nil
+	}
+	for _, record := range snapshot.Elements {
+		if record.Name != name {
+			continue
+		}
+		for _, candidate := range record.Actions {
+			if candidate != action {
+				continue
+			}
+			copy := record
+			return &copy
+		}
 	}
 	return nil
 }

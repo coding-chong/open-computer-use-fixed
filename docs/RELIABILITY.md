@@ -7,7 +7,7 @@
 - 端到端 smoke：`./scripts/run-tool-smoke-tests.sh`
 - macOS SkyLight 实机回归：`OPEN_COMPUTER_USE_RUN_SKY_CLICK_LIVE_TEST=1 swift test --filter SkyClickLiveTests`
 - Linux runtime：`(cd apps/OpenComputerUseLinux && go test ./...)`、`./scripts/build-open-computer-use-linux.sh --arch arm64`
-- Windows runtime：`(cd apps/OpenComputerUseWindows && go test ./...)`、`./scripts/build-open-computer-use-windows.sh --arch amd64`，以及 `pwsh.exe -NoProfile -ExecutionPolicy Bypass -File apps/OpenComputerUseWindows/fixtures/run-interactive-smoke.ps1`；普通 WPF/WinForms fixture 脚本也可单独运行做交互式桌面验证。
+- Windows runtime：`(cd apps/OpenComputerUseWindows && go test ./...)`、`./scripts/build-open-computer-use-windows.sh --arch amd64`，以及 `pwsh.exe -NoProfile -ExecutionPolicy Bypass -File apps/OpenComputerUseWindows/fixtures/run-interactive-smoke.ps1`；runner 可由 PS7/PS5.1 执行，嵌入 runtime 会在 PS5.1 下验证，native WinForms fixture host 可用 `-NativeFixtureHostPath` 独立指定。普通 WPF/WinForms fixture 脚本也可单独运行做交互式桌面验证。
 - 本地诊断：
   - `open-computer-use doctor`
   - `open-computer-use snapshot <app>`
@@ -22,7 +22,8 @@
 - GNOME Wayland 截图可能被 compositor 限制，当前 Linux bridge 会把黑图视为无效截图并省略 image block。
 - Windows runtime 也依赖已登录的交互式桌面 session。UIA/窗口 tree 在 SSH 或 service context 中可能为空。每个 action 都绑定 preceding snapshot 的 PID、process start time 和 top-level HWND；共享 executable alias 会在 Go cache 中标记为 ambiguous，必须改用精确标题或 PID。坐标 action 的物理 bounds 变化超过 1 pixel 会要求重新 snapshot，`app_post` 还要求 native target 是 snapshot window 的 descendant 且坐标在窗口内。需要真实 pointer 或 keyboard 输入时，部署进程必须显式配置 `OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT=1`；pointer 额外需要 `OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1`；未授权的 `press_key` 在发送任何键消息前 fail closed。keyboard 仍可能因 foreground policy 或 UIPI 被拒绝，pointer 则会在目标不处于请求坐标最上层时 fail closed。
 - Windows element-index action 还必须在同一进程和 top-level HWND 内通过非空、可比较的 `runtimeId` 找到当前子元素；每个 runtime-ID component 必须是可表示的 signed 32-bit UIA 整数，字符串、空白、小数、null 成员和越界数值都 fail closed。只有操作实际携带 element record 时才进入该 resolver，因此 coordinate-only click/drag 结构性地保持在子元素身份边界之外。解析始终从已经验证的 snapshot HWND 建立 UIA 根。名称、automation ID 和 control type 不能证明元素未被替换；解析失败统一要求重新执行 `get_app_state`，且必须发生在 UIA pattern、frame 坐标、窗口消息或输入注入之前。语义 action 可继续支持缺失 `frame`。少数 provider 理论上可能在重建后复用 runtime ID；该情况需要未来更强的 parent/path 或 provider-specific identity，而不能恢复 metadata fallback。
-- Windows Enterprise Code Integrity 或其他主机控制可能拒绝或移除本地新构建的未签名 `.exe`（Code Integrity 事件可包括 3033/3077）。不要禁用策略或替换为未验证 executable。仅在受控本地开发中，可由受信任的已安装 Go toolchain 通过 `go run . mcp` 运行经审查 checkout；PowerShell 7 fixture runner 只验证 source `runtime.ps1` 和桌面边界。这些都是诊断路径，不是签名 release 的替代方案，独立部署仍必须换回经策略批准的 release artifact。
+- Windows Enterprise Code Integrity 或其他主机控制可能拒绝或移除本地新构建的未签名 `.exe`（Code Integrity 事件可包括 3033/3077）。不要禁用策略或替换为未验证 executable。仅在受控本地开发中，可由受信任的已安装 Go toolchain 通过 `go run . mcp` 运行经审查 checkout；PowerShell 7 fixture runner 只验证 source `runtime.ps1` 和桌面边界。这些都是诊断路径，不是签名 release 的替代方案，独立部署仍必须换回经策略批准的 release artifact。PS5.1/.NET Framework WinForms UIA 可能把 fixture child controls 暴露成 generic `Pane`，native-HWND positive 需选择能暴露 `Edit`/`Button`/`Slider` 的 native fixture host。
+- Windows `scroll.pages` 接受 0 到 100 之间的正数；semantic ScrollPattern 使用一次按 viewport 百分比计算的操作，app-scoped fallback 使用一次 wheel message，避免多页循环在 30 秒 deadline 中途留下未知执行进度。若返回 `Windows scroll timed out; refresh with get_app_state before retrying because the operation may have been applied.`，必须先刷新状态再决定是否重试，不能盲目重放。
 
 ## 当前故障排查顺序
 
@@ -32,7 +33,7 @@
 4. 如果只有 `sky_click` 失败，先重新执行 `get_app_state`，确认窗口仍为 on-screen、未隐藏/最小化且没有切换 Space；错误里出现 `missing SkyLight symbols` 时不要改用隐式 fallback，应按当前 macOS 版本重新验证私有 SPI。被遮挡的 Chromium 页面仍无效果时，再用受控页面区分 renderer 策略变化与坐标/window-local 映射问题。
 5. 如果只想验证仓库基线，直接跑 fixture + smoke，不要先在复杂第三方 app 上排查。
 6. 排查 Linux runtime 时，先确认目标命令是否由桌面用户运行，再用 `open-computer-use call list_apps` 和 `open-computer-use snapshot <app>` 区分 session/env 问题与 AT-SPI tree/action 问题。如果是 Codex MCP，重新执行 `open-computer-use install-codex-mcp` 后重启 Codex，确认配置仍是 `open-computer-use mcp`。
-7. 排查 Windows runtime 时，先用 PowerShell 7 执行 `apps/OpenComputerUseWindows/fixtures/run-interactive-smoke.ps1`，再在 WPF/WinForms 夹具中区分 UIA pattern、strict `app_post`、元素 runtime-ID 解析和已授权 interactive input。若 selector 是 executable name 且存在多个实例，改用 fixture window title 或 PID；不要依赖 ambiguous alias。元素被替换或 runtime ID 缺失时，应预期 bounded target-changed 错误并重新 snapshot。WPF `app_post` 无 child HWND 时应返回 capability error；不要把它当作可退到 global 的信号。需要键盘时先聚焦目标，仍失败时检查 foreground ownership、UIPI/elevation 和三个显式环境变量。
+7. 排查 Windows runtime 时，先用 PowerShell 7 执行 `apps/OpenComputerUseWindows/fixtures/run-interactive-smoke.ps1`；需要验证 PS5.1 runner/runtime 边界时，使用 `-FixtureHostPath powershell.exe -RuntimeHostPath powershell.exe -NativeFixtureHostPath pwsh.exe`，再在 WPF/WinForms 夹具中区分 UIA pattern、strict `app_post`、元素 runtime-ID 解析和已授权 interactive input。若 selector 是 executable name 且存在多个实例，改用 fixture window title 或 PID；不要依赖 ambiguous alias。元素被替换或 runtime ID 缺失时，应预期 bounded target-changed 错误并重新 snapshot。WPF `app_post` 无 child HWND 时应返回 capability error；不要把它当作可退到 global 的信号。需要键盘时先聚焦目标，仍失败时检查 foreground ownership、UIPI/elevation 和三个显式环境变量。
 
 ## 后续补强方向
 
