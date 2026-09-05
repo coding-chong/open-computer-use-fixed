@@ -3,7 +3,8 @@ param(
     [string]$ReadyPath = "",
     [string]$StatePath = "",
     [int]$Left = -1,
-    [int]$Top = -1
+    [int]$Top = -1,
+    [switch]$AllowOffscreenPlacement
 )
 
 $ErrorActionPreference = "Stop"
@@ -127,7 +128,7 @@ $reader = New-Object System.Xml.XmlNodeReader $xaml
 $window = [System.Windows.Markup.XamlReader]::Load($reader)
 $window.Title = $script:DisplayTitle
 [System.Windows.Automation.AutomationProperties]::SetName($window, $script:DisplayTitle)
-if ($Left -ge 0 -and $Top -ge 0) {
+if (($Left -ge 0 -and $Top -ge 0) -or $AllowOffscreenPlacement) {
     $window.WindowStartupLocation = [System.Windows.WindowStartupLocation]::Manual
     $window.Left = $Left
     $window.Top = $Top

@@ -129,20 +129,12 @@ function Read-State([string]$path) {
     throw 'Fixture state could not be read consistently.'
 }
 
-function Start-Fixture([string]$scriptName, [string]$instance, [int]$left, [int]$top, [string]$hostPath) {
+function Start-Fixture([string]$scriptName, [string]$instance, [int]$left, [int]$top, [string]$hostPath, [bool]$allowOffscreenPlacement = $false) {
     $readyPath = Join-Path $runRoot ($instance + '-ready.json')
     $statePath = Join-Path $runRoot ($instance + '-state.json')
     $scriptPath = Join-Path $fixtureRoot $scriptName
-    $arguments = @(
-        '-NoProfile',
-        '-ExecutionPolicy', 'Bypass',
-        '-File', $scriptPath,
-        '-InstanceName', $instance,
-        '-ReadyPath', $readyPath,
-        '-StatePath', $statePath,
-        '-Left', [string]$left,
-        '-Top', [string]$top
-    )
+    $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $scriptPath, '-InstanceName', $instance, '-ReadyPath', $readyPath, '-StatePath', $statePath, '-Left', [string]$left, '-Top', [string]$top)
+    if ($allowOffscreenPlacement) { $arguments += '-AllowOffscreenPlacement' }
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
     $startInfo.FileName = $hostPath
     $startInfo.UseShellExecute = $false
@@ -150,12 +142,7 @@ function Start-Fixture([string]$scriptName, [string]$instance, [int]$left, [int]
     Set-ProcessArguments $startInfo $arguments
     $process = [System.Diagnostics.Process]::Start($startInfo)
     Assert-Condition ($null -ne $process) ('Could not start fixture ' + $instance)
-    $target = [pscustomobject]@{
-        Process = $process
-        Instance = $instance
-        ReadyPath = $readyPath
-        StatePath = $statePath
-    }
+    $target = [pscustomobject]@{ Process = $process; Instance = $instance; ReadyPath = $readyPath; StatePath = $statePath }
     [void]$fixtures.Add($target)
     return $target
 }
@@ -264,6 +251,18 @@ function Invoke-TypeText($state, $snapshot, [string]$text) {
         expectedMainWindowHandle = [int64]$snapshot.app.mainWindowHandle
     })
 }
+function Invoke-FocusedTypeText($state, $snapshot, [int64]$hwndValue, [string]$name, [string]$controlTypeName, [string]$valuePrefix, [string]$text) {
+    $response = $null
+    for ($attempt = 0; $attempt -lt 3; $attempt++) {
+        Set-FixtureFocus $hwndValue $name $controlTypeName $valuePrefix | Out-Null
+        $response = Invoke-TypeText $state $snapshot $text
+        if ($response.ok -or -not (Test-TypeTextTargetResponse $response)) {
+            return $response
+        }
+    }
+    return $response
+}
+
 
 function Wait-FixtureStateCondition($target, [scriptblock]$predicate, [string]$description) {
     $deadline = [datetime]::UtcNow.AddSeconds(10)
@@ -380,18 +379,21 @@ function Set-FixtureFocus([int64]$hwndValue, [string]$name, [string]$controlType
                 continue
             }
         }
-        $element.SetFocus()
-        Start-Sleep -Milliseconds 180
-        $focused = [Windows.Automation.AutomationElement]::FocusedElement
-        Assert-Condition ($null -ne $focused) ('No focused element after selecting ' + $name)
-        Assert-Condition ([string]$focused.Current.Name -eq $name) ('Unexpected focused element after selecting ' + $name)
-        Assert-Condition ([string]$focused.Current.ControlType.ProgrammaticName -eq $controlTypeName) ('Unexpected focused control type after selecting ' + $name)
-        return [pscustomobject]@{
-            name = [string]$focused.Current.Name
-            controlType = [string]$focused.Current.ControlType.ProgrammaticName
-            processId = [int]$focused.Current.ProcessId
-            nativeWindowHandle = [int64]$focused.Current.NativeWindowHandle
+        $deadline = [datetime]::UtcNow.AddSeconds(5)
+        while ([datetime]::UtcNow -lt $deadline) {
+            $focused = [Windows.Automation.AutomationElement]::FocusedElement
+            if ($null -ne $focused -and [int]$focused.Current.ProcessId -eq [int]$root.Current.ProcessId -and [string]$focused.Current.Name -eq $name -and [string]$focused.Current.ControlType.ProgrammaticName -eq $controlTypeName) {
+                return [pscustomobject]@{
+                    name = [string]$focused.Current.Name
+                    controlType = [string]$focused.Current.ControlType.ProgrammaticName
+                    processId = [int]$focused.Current.ProcessId
+                    nativeWindowHandle = [int64]$focused.Current.NativeWindowHandle
+                }
+            }
+            $element.SetFocus()
+            Start-Sleep -Milliseconds 180
         }
+        throw ('Could not stabilize focus on ' + $name + ' (' + $controlTypeName + ')')
     }
     throw ('Could not focus ' + $name + ' (' + $controlTypeName + ')')
 }
@@ -414,16 +416,14 @@ try {
     Add-Type -AssemblyName UIAutomationTypes
     New-Item -ItemType Directory -Path $runRoot -Force | Out-Null
     $targetA = Start-Fixture 'wpf-test-bench.ps1' 'A' 20 20 $script:FixtureHostPathResolved
-    $targetB = Start-Fixture 'wpf-test-bench.ps1' 'B' 1280 20 $script:FixtureHostPathResolved
-    $nativeTarget = Start-Fixture 'native-pointer-bench.ps1' 'N' 40 900 $script:NativeFixtureHostPathResolved
+    $proxyTarget = Start-Fixture 'wpf-test-bench.ps1' 'Proxy' -14222 -14222 $script:FixtureHostPathResolved $true
+    $proxyState = Wait-FixtureReady $proxyTarget
+    $proxyResponse = Invoke-Runtime ([pscustomobject]@{ tool = 'get_app_state'; app = $proxyState.title; include_image = $true; text_limit = 250; max_tree_nodes = 180; max_tree_depth = 16 })
+    $offscreenProxyRejected = (-not $proxyResponse.ok -and $proxyResponse.error -eq 'No usable top-level interactive window is available for the requested app.')
     $stateA = Wait-FixtureReady $targetA
-    $stateB = Wait-FixtureReady $targetB
-    $nativeState = Wait-FixtureReady $nativeTarget
-
     $snapshotA = Get-Snapshot $stateA.title
-    $snapshotB = Get-Snapshot $stateB.title
-    $nativeSnapshot = Get-Snapshot $nativeState.title
-    Assert-Condition ($snapshotA.app.pid -ne $snapshotB.app.pid -and $snapshotA.app.mainWindowHandle -ne $snapshotB.app.mainWindowHandle) 'A and B did not receive distinct identities.'
+    Assert-Condition ($null -ne $snapshotA.app -and $snapshotA.app.pid -eq $stateA.pid -and $snapshotA.app.mainWindowHandle -eq $stateA.hwnd) 'A snapshot did not retain its fixture identity.'
+
 
     $screenshotResponse = Invoke-Runtime ([pscustomobject]@{
         tool = 'get_app_state'; app = $stateA.title; include_image = $true; text_limit = 250; max_tree_nodes = 180; max_tree_depth = 16
@@ -686,11 +686,11 @@ try {
     $afterStaleElement = Read-State $targetA.StatePath
     Assert-Condition ($afterStaleElement.identityPrimaryValue -eq $addressedPrimaryValue -and $afterStaleElement.identityDuplicateValue -eq $addressedDuplicateValue -and $afterStaleElement.identityReplacementCount -eq 1) 'A stale element action changed a replacement or duplicate target.'
 
+    $alternateTitle = 'Open Computer Use MCP WPF Test Bench [B]'
     $baselineCrossA = Read-State $targetA.StatePath
-    $baselineB = Read-State $targetB.StatePath
     $crossQuery = [pscustomobject]@{
         tool = 'set_value'
-        app = $stateB.title
+        app = $alternateTitle
         element = $replacementPrimaryElement
         value = 'must-not-cross-query'
         expectedPid = [int]$snapshotA.app.pid
@@ -701,23 +701,21 @@ try {
     Assert-TargetChangedResponse $crossResult 'A pinned identity was accepted under a different app selector.'
     Start-Sleep -Milliseconds 200
     $afterCrossA = Read-State $targetA.StatePath
-    $afterCrossB = Read-State $targetB.StatePath
-    Assert-Condition ($afterCrossA.setValue -eq $baselineCrossA.setValue -and $afterCrossB.setValue -eq $baselineB.setValue) 'A cross-query pinned action changed a fixture.'
+    Assert-Condition ($afterCrossA.setValue -eq $baselineCrossA.setValue) 'A cross-query pinned action changed the fixture.'
 
     $badIdentity = [pscustomobject]@{
         tool = 'set_value'
-        app = $stateB.title
+        app = $stateA.title
         element = $replacementPrimaryElement
         value = 'must-not-write'
-        expectedPid = [int]$snapshotB.app.pid
-        expectedProcessStartTimeTicks = [int64]$snapshotA.app.processStartTimeTicks
+        expectedPid = [int]$snapshotA.app.pid
+        expectedProcessStartTimeTicks = ([int64]$snapshotA.app.processStartTimeTicks + 1)
         expectedMainWindowHandle = [int64]$snapshotA.app.mainWindowHandle
     }
     $badResult = Invoke-Runtime $badIdentity
     Assert-Condition ((-not $badResult.ok) -and $badResult.error -eq 'Target changed; call get_app_state again.') 'Mismatched identity was not rejected.'
     $afterBadA = Read-State $targetA.StatePath
-    $afterBadB = Read-State $targetB.StatePath
-    Assert-Condition ($afterBadA.setValue -eq $afterCrossA.setValue -and $afterBadB.setValue -eq $afterCrossB.setValue) 'Mismatched identity mutated a fixture.'
+    Assert-Condition ($afterBadA.setValue -eq $afterCrossA.setValue) 'Mismatched identity mutated the fixture.'
 
     Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class OcuSmokeWindow { [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left; public int Top; public int Right; public int Bottom; } [DllImport("user32.dll", SetLastError=true)] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint flags); [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect); public static int[] Position(IntPtr hWnd) { RECT rect; if (!GetWindowRect(hWnd, out rect)) { return null; } return new int[] { rect.Left, rect.Top }; } }'
     $oldBounds = $snapshotA.windowBounds
@@ -773,7 +771,7 @@ try {
         $beforeFocusedTypeText = Read-State $targetA.StatePath
         $focusedType = Set-FixtureFocus $stateA.hwnd 'Type text target' 'ControlType.Edit' ''
         Assert-Condition ($focusedType.processId -eq $snapshotA.app.pid) 'The WPF type_text target focus escaped the requested process.'
-        $focusedTypeTextResponse = Invoke-TypeText $stateA $snapshotA $focusedSuccessText
+        $focusedTypeTextResponse = Invoke-FocusedTypeText $stateA $snapshotA $stateA.hwnd 'Type text target' 'ControlType.Edit' '' $focusedSuccessText
         Assert-Condition $focusedTypeTextResponse.ok ('Focused WPF type_text failed: ' + $focusedTypeTextResponse.error)
         $afterFocusedTypeText = Wait-FixtureStateCondition $targetA {
             param($state)
@@ -814,7 +812,7 @@ try {
         Assert-Condition ($null -ne $duplicateTypeTextRecord) 'The duplicate focused type_text target was not found.'
         $focusDuplicateForTypeText = Set-FixtureFocus $stateA.hwnd 'Identity replacement target' 'ControlType.Edit' 'identity-duplicate-'
         $beforeDuplicateTypeText = Read-State $targetA.StatePath
-        $duplicateTypeTextResponse = Invoke-TypeText $stateA $snapshotA $duplicateSuccessText
+        $duplicateTypeTextResponse = Invoke-FocusedTypeText $stateA $snapshotA $stateA.hwnd 'Identity replacement target' 'ControlType.Edit' 'identity-duplicate-' $duplicateSuccessText
         Assert-Condition $duplicateTypeTextResponse.ok ('Focused duplicate WPF type_text failed: ' + $duplicateTypeTextResponse.error)
         $afterDuplicateTypeText = Wait-FixtureStateCondition $targetA {
             param($state)
@@ -828,6 +826,35 @@ try {
         )
         Assert-Condition $duplicateFocusedTypeTextIsolated 'Focused duplicate type_text did not stay on the focused control.'
 
+
+        $focusTypeForDisabledFallback = Set-FixtureFocus $stateA.hwnd 'Type text target' 'ControlType.Edit' ''
+        $savedFallbackForDisabledTest = [Environment]::GetEnvironmentVariable($typeTextEnvironmentName)
+        try {
+            [Environment]::SetEnvironmentVariable($typeTextEnvironmentName, $null)
+            $beforeDisabledFallback = Read-State $targetA.StatePath
+            $disabledFallbackTypeTextResponse = Invoke-FocusedTypeText $stateA $snapshotA $stateA.hwnd 'Type text target' 'ControlType.Edit' '' 'must-not-use-disabled-fallback'
+            Assert-Condition (Test-TypeTextFallbackResponse $disabledFallbackTypeTextResponse) ('Disabled UIA text fallback did not return its bounded capability error: ' + $disabledFallbackTypeTextResponse.error)
+            $afterDisabledFallback = Read-State $targetA.StatePath
+            $disabledUIATextFallbackRejected = (
+                (Test-TypeTextFallbackResponse $disabledFallbackTypeTextResponse) -and
+                $afterDisabledFallback.typed -eq $beforeDisabledFallback.typed -and
+                $disabledFallbackTypeTextResponse.error -notmatch 'runtime\.ps1|ScriptStackTrace|line [0-9]+'
+            )
+            Assert-Condition $disabledUIATextFallbackRejected 'Disabled UIA text fallback changed state or leaked diagnostics.'
+        } finally {
+            if ($null -eq $savedFallbackForDisabledTest) {
+                Remove-Item -LiteralPath ('Env:' + $typeTextEnvironmentName) -ErrorAction SilentlyContinue
+            } else {
+                Set-Item -Path ('Env:' + $typeTextEnvironmentName) -Value $savedFallbackForDisabledTest
+            }
+        }
+        # The separate B fixture is needed only for this cross-window focus case.
+        $targetB = Start-Fixture 'wpf-test-bench.ps1' 'B' 0 760 $script:FixtureHostPathResolved
+        $stateB = Wait-FixtureReady $targetB
+        $snapshotB = Get-Snapshot $stateB.title
+        Assert-Condition ($snapshotA.app.pid -ne $snapshotB.app.pid -and $snapshotA.app.mainWindowHandle -ne $snapshotB.app.mainWindowHandle) 'A and B did not receive distinct identities.'
+        [void][OcuSmokeWindow]::SetWindowPos([IntPtr]$stateB.hwnd, [IntPtr]::Zero, 0, 0, 0, 0, 0x0001 -bor 0x0004 -bor 0x0040)
+        Start-Sleep -Milliseconds 180
         $snapshotBForTypeText = Get-Snapshot $stateB.title
         $focusOutsideTypeText = Set-FixtureFocus $stateB.hwnd 'Type text target' 'ControlType.Edit' ''
         $beforeOutsideTypeTextA = Read-State $targetA.StatePath
@@ -844,29 +871,18 @@ try {
             $afterOutsideTypeTextB.typed -eq $beforeOutsideTypeTextB.typed
         )
         Assert-Condition $outsideWindowTypeTextRejected 'Outside-window type_text changed a fixture state.'
+        # B exists only to prove that A refuses an out-of-window focus. Remove it
+        # before resuming A's focus-sensitive tests on a one-window desktop.
+        [void][OcuSmokeWindow]::SetWindowPos([IntPtr]$stateB.hwnd, [IntPtr]::Zero, -14222, -14222, 0, 0, 0x0001 -bor 0x0004 -bor 0x0040)
+        Start-Sleep -Milliseconds 180
+        [void][OcuSmokeWindow]::SetWindowPos([IntPtr]$stateA.hwnd, [IntPtr]::Zero, [int]$snapshotA.windowBounds.x, [int]$snapshotA.windowBounds.y, 0, 0, 0x0001 -bor 0x0004 -bor 0x0040)
+        Start-Sleep -Milliseconds 180
 
-        $focusTypeForDisabledFallback = Set-FixtureFocus $stateA.hwnd 'Type text target' 'ControlType.Edit' ''
-        $savedFallbackForDisabledTest = [Environment]::GetEnvironmentVariable($typeTextEnvironmentName)
-        try {
-            [Environment]::SetEnvironmentVariable($typeTextEnvironmentName, $null)
-            $beforeDisabledFallback = Read-State $targetA.StatePath
-            $disabledFallbackTypeTextResponse = Invoke-TypeText $stateA $snapshotA 'must-not-use-disabled-fallback'
-            Assert-Condition (Test-TypeTextFallbackResponse $disabledFallbackTypeTextResponse) 'Disabled UIA text fallback did not return its bounded capability error.'
-            $afterDisabledFallback = Read-State $targetA.StatePath
-            $disabledUIATextFallbackRejected = (
-                (Test-TypeTextFallbackResponse $disabledFallbackTypeTextResponse) -and
-                $afterDisabledFallback.typed -eq $beforeDisabledFallback.typed -and
-                $disabledFallbackTypeTextResponse.error -notmatch 'runtime\.ps1|ScriptStackTrace|line [0-9]+'
-            )
-            Assert-Condition $disabledUIATextFallbackRejected 'Disabled UIA text fallback changed state or leaked diagnostics.'
-        } finally {
-            if ($null -eq $savedFallbackForDisabledTest) {
-                Remove-Item -LiteralPath ('Env:' + $typeTextEnvironmentName) -ErrorAction SilentlyContinue
-            } else {
-                Set-Item -Path ('Env:' + $typeTextEnvironmentName) -Value $savedFallbackForDisabledTest
-            }
-        }
-
+        # Run all WPF identity/focus paths before a native fixture owns another
+        # foreground window on small single-desktop hosts.
+        $nativeTarget = Start-Fixture 'native-pointer-bench.ps1' 'N' 1120 0 $script:NativeFixtureHostPathResolved
+        $nativeState = Wait-FixtureReady $nativeTarget
+        $nativeSnapshot = Get-Snapshot $nativeState.title
         $nativeTypeElement = Find-Element $nativeSnapshot 'Native type_text target' 'SetValue' $true
         Assert-Condition ($null -ne $nativeTypeElement) 'The native type_text target was not found with a child HWND.'
         $nativeSeedValue = 'native-seed-'
@@ -885,7 +901,7 @@ try {
             [Environment]::SetEnvironmentVariable($typeTextEnvironmentName, $null)
             $beforeNativeTypeText = Read-State $nativeTarget.StatePath
             Assert-Condition ($beforeNativeTypeText.typed -eq $nativeSeedValue) 'Native type_text seed did not stabilize before typing.'
-            $nativeTypeTextResponse = Invoke-TypeText $nativeState $nativeSnapshot $nativeSuccessText
+            $nativeTypeTextResponse = Invoke-FocusedTypeText $nativeState $nativeSnapshot $nativeState.hwnd 'Native type_text target' 'ControlType.Edit' '' $nativeSuccessText
             Assert-Condition $nativeTypeTextResponse.ok ('Native child-HWND type_text failed: ' + $nativeTypeTextResponse.error)
             $afterNativeTypeText = Wait-FixtureStateCondition $nativeTarget {
                 param($state)
@@ -1228,6 +1244,7 @@ try {
         $identityPinned,
         $crossQueryRejected,
         $screenshotCaptureBounded,
+        $offscreenProxyRejected,
         $identityValidationPassed,
         $numericValidationPassed,
         $mismatchRejected,

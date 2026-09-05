@@ -496,6 +496,24 @@ func TestWindowsRuntimeBindsActionsToSnapshotIdentity(t *testing.T) {
 		t.Fatal("actions must not re-resolve the mutable app query")
 	}
 }
+func TestWindowsRuntimeUsesSharedInteractiveTargetProof(t *testing.T) {
+	for _, marker := range []string{
+		"function Test-FrameIntersects($candidate, $desktop)",
+		"function Test-FramesMatch($left, $right, [double]$tolerance = 1)",
+		"function Test-UsableTopLevelWindow($process, $element, [IntPtr]$hwnd)",
+		"function Resolve-InteractiveWindowTarget($process)",
+		"GetSystemMetrics($SM_XVIRTUALSCREEN)",
+		"GetAncestor($hwnd, 2)",
+		"(Get-NativeWindowHandle $element) -ne $hwnd",
+		"if ($usable.Count -ne 1)",
+		"No usable top-level interactive window is available for the requested app.",
+		"Resolve-InteractiveWindowTarget $process",
+	} {
+		if !strings.Contains(windowsRuntimeScript, marker) {
+			t.Fatalf("shared interactive target proof missing %q", marker)
+		}
+	}
+}
 
 func TestWindowsRuntimeRequiresExactValidElementIdentity(t *testing.T) {
 	for _, marker := range []string{
@@ -1203,6 +1221,10 @@ func TestBoundedRuntimeErrorsNeverExposeDiagnostics(t *testing.T) {
 	if got := boundedRuntimeError("Target changed; call get_app_state again."); got != targetChangedMessage {
 		t.Fatalf("target-change error = %q", got)
 	}
+	const unavailableMessage = "No usable top-level interactive window is available for the requested app."
+	if got := boundedRuntimeError(unavailableMessage); got != unavailableMessage {
+		t.Fatalf("unavailable target error = %q, want %q", got, unavailableMessage)
+	}
 	for _, message := range []string{
 		"panic at C:\\temp\\runtime.ps1:42",
 		"bad operation.json payload",
@@ -1825,7 +1847,7 @@ func TestWindowsRuntimeScreenshotCaptureContract(t *testing.T) {
 		"Normalize-BitmapAlpha",
 		"CopyFromScreen",
 		"function Assert-SnapshotCaptureTarget",
-		"Get-ProcessTargetHandle $process $currentElement",
+		"Resolve-InteractiveWindowTarget $process",
 		"$ExpectedStartTimeTicks",
 		"screenshotPngBase64 = Capture-WindowPngBase64 $bounds $targetHwnd $IncludeImage $process $startTimeTicks",
 	} {
@@ -1847,7 +1869,7 @@ func TestWindowsActionRefreshRetainsSnapshotWindowIdentity(t *testing.T) {
 		"if ($ExpectedHwnd -ne [IntPtr]::Zero -and $targetHwnd -ne $ExpectedHwnd)",
 		"if ($ExpectedStartTimeTicks -gt 0 -and $startTimeTicks -ne $ExpectedStartTimeTicks)",
 		"function Assert-SnapshotCaptureTarget",
-		"$currentHwnd = Get-ProcessTargetHandle $process $currentElement",
+		"$target = Resolve-InteractiveWindowTarget $process",
 		"Build-SnapshotForProcess $process $operation.app $null $AccessibilityTreeMaxNodeCount $AccessibilityTreeMaxDepth $true $hwnd ([int64]$operation.expectedProcessStartTimeTicks)",
 	} {
 		if !strings.Contains(windowsRuntimeScript, marker) {

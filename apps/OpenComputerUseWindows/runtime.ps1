@@ -500,31 +500,23 @@ function Resolve-SnapshotActionTarget($operation) {
     $expectedPid = $identity.pid
     $expectedStartTimeTicks = $identity.startTimeTicks
     $expectedMainWindowHandle = $identity.mainWindowHandle
-
     try {
         $process = Get-Process -Id $expectedPid -ErrorAction Stop
+        if ((Get-ProcessStartTimeTicks $process) -ne $expectedStartTimeTicks) {
+            Throw-TargetChanged
+        }
+        if (-not (Test-ProcessMatchesSelector $process ([string]$operation.app))) {
+            Throw-TargetChanged
+        }
+        $target = Resolve-InteractiveWindowTarget $process
+        $hwnd = $target.hwnd
+        if ($hwnd.ToInt64() -ne $expectedMainWindowHandle) {
+            Throw-TargetChanged
+        }
+        return [pscustomobject]@{ process = $process; hwnd = $hwnd; element = $target.element; bounds = $target.bounds }
     } catch {
+        if ($PSItem.Exception.Message -eq "Target changed; call get_app_state again.") { throw }
         Throw-TargetChanged
-    }
-    if ((Get-ProcessStartTimeTicks $process) -ne $expectedStartTimeTicks) {
-        Throw-TargetChanged
-    }
-    if (-not (Test-ProcessMatchesSelector $process ([string]$operation.app))) {
-        Throw-TargetChanged
-    }
-
-    try {
-        $element = Get-MainElement $process
-        $hwnd = Get-ProcessTargetHandle $process $element
-    } catch {
-        Throw-TargetChanged
-    }
-    if ($hwnd -eq [IntPtr]::Zero -or $hwnd.ToInt64() -ne $expectedMainWindowHandle) {
-        Throw-TargetChanged
-    }
-    return [pscustomobject]@{
-        process = $process
-        hwnd = $hwnd
     }
 }
 
@@ -653,6 +645,142 @@ function Get-WindowRectFrame([IntPtr]$hwnd) {
         return New-Frame $rect.Left $rect.Top ($rect.Right - $rect.Left) ($rect.Bottom - $rect.Top)
     }
     return $null
+}
+function Get-VirtualDesktopFrame {
+    $x = [OCUWin32]::GetSystemMetrics($SM_XVIRTUALSCREEN)
+    $y = [OCUWin32]::GetSystemMetrics($SM_YVIRTUALSCREEN)
+    $width = [OCUWin32]::GetSystemMetrics($SM_CXVIRTUALSCREEN)
+    $height = [OCUWin32]::GetSystemMetrics($SM_CYVIRTUALSCREEN)
+    return New-Frame $x $y $width $height
+}
+
+function Test-FrameIntersects($candidate, $desktop) {
+    if ($null -eq $candidate -or $null -eq $desktop) {
+        return $false
+    }
+    foreach ($frame in @($candidate, $desktop)) {
+        foreach ($name in @('x', 'y', 'width', 'height')) {
+            try {
+                if (-not (Test-FiniteNumber $frame.$name)) {
+                    return $false
+                }
+            } catch {
+                return $false
+            }
+        }
+    }
+    try {
+        if ([double]$candidate.width -le 0 -or [double]$candidate.height -le 0 -or [double]$desktop.width -le 0 -or [double]$desktop.height -le 0) {
+            return $false
+        }
+        return (
+            ([double]$candidate.x -lt ([double]$desktop.x + [double]$desktop.width)) -and
+            (([double]$candidate.x + [double]$candidate.width) -gt [double]$desktop.x) -and
+            ([double]$candidate.y -lt ([double]$desktop.y + [double]$desktop.height)) -and
+            (([double]$candidate.y + [double]$candidate.height) -gt [double]$desktop.y)
+        )
+    } catch {
+        return $false
+    }
+}
+
+function Test-FramesMatch($left, $right, [double]$tolerance = 1) {
+    if ($null -eq $left -or $null -eq $right -or -not (Test-FiniteNumber $tolerance) -or $tolerance -lt 0) {
+        return $false
+    }
+    foreach ($name in @('x', 'y', 'width', 'height')) {
+        try {
+            if (-not (Test-FiniteNumber $left.$name) -or -not (Test-FiniteNumber $right.$name) -or [math]::Abs(([double]$left.$name) - ([double]$right.$name)) -gt $tolerance) {
+                return $false
+            }
+        } catch {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Test-UsableTopLevelWindow($process, $element, [IntPtr]$hwnd) {
+    if ($null -eq $process -or $null -eq $element -or $hwnd -eq [IntPtr]::Zero) {
+        return $false
+    }
+    if (-not [OCUWin32]::IsWindow($hwnd) -or -not (Test-HwndOwnedByProcess $hwnd $process)) {
+        return $false
+    }
+    $rootHwnd = [OCUWin32]::GetAncestor($hwnd, 2)
+    if ($rootHwnd -eq [IntPtr]::Zero -or $rootHwnd -ne $hwnd) {
+        return $false
+    }
+    $nativeBounds = Get-WindowRectFrame $hwnd
+    $desktopBounds = Get-VirtualDesktopFrame
+    if ($null -eq $nativeBounds -or $nativeBounds.width -le 0 -or $nativeBounds.height -le 0 -or -not (Test-FrameIntersects $nativeBounds $desktopBounds)) {
+        return $false
+    }
+    try {
+        if ([int]$element.Current.ProcessId -ne [int]$process.Id -or (Get-NativeWindowHandle $element) -ne $hwnd) {
+            return $false
+        }
+        $rect = $element.Current.BoundingRectangle
+        if ($rect.IsEmpty -or $rect.Width -le 0 -or $rect.Height -le 0) {
+            return $false
+        }
+        $uiaBounds = New-Frame $rect.X $rect.Y $rect.Width $rect.Height
+        if ($null -eq $uiaBounds -or $uiaBounds.width -le 0 -or $uiaBounds.height -le 0) {
+            return $false
+        }
+        return Test-FramesMatch $nativeBounds $uiaBounds 1
+    } catch {
+        return $false
+    }
+}
+
+function Resolve-InteractiveWindowTarget($process) {
+    if ($null -eq $process) {
+        throw "No usable top-level interactive window is available for the requested app."
+    }
+    $candidates = New-Object System.Collections.Generic.List[object]
+    $handles = New-Object 'System.Collections.Generic.HashSet[Int64]'
+    $mainHwnd = [IntPtr]$process.MainWindowHandle
+    if ($mainHwnd -ne [IntPtr]::Zero -and $handles.Add($mainHwnd.ToInt64())) {
+        try {
+            $mainElement = [Windows.Automation.AutomationElement]::FromHandle($mainHwnd)
+            if (Test-UsableTopLevelWindow $process $mainElement $mainHwnd) {
+                return [pscustomobject]@{
+                    hwnd = $mainHwnd
+                    element = $mainElement
+                    bounds = Get-WindowRectFrame $mainHwnd
+                }
+            }
+        } catch {
+        }
+    }
+    try {
+        $condition = New-Object Windows.Automation.PropertyCondition ([Windows.Automation.AutomationElement]::ProcessIdProperty), $process.Id
+        $children = [Windows.Automation.AutomationElement]::RootElement.FindAll([Windows.Automation.TreeScope]::Children, $condition)
+        $limit = [math]::Min([int]$children.Count, 256)
+        for ($i = 0; $i -lt $limit; $i++) {
+            $element = $children.Item($i)
+            $hwnd = Get-NativeWindowHandle $element
+            if ($hwnd -ne [IntPtr]::Zero -and $handles.Add($hwnd.ToInt64())) {
+                [void]$candidates.Add([pscustomobject]@{ hwnd = $hwnd; element = $element })
+            }
+        }
+    } catch {
+    }
+    $usable = New-Object System.Collections.Generic.List[object]
+    foreach ($candidate in $candidates) {
+        if (Test-UsableTopLevelWindow $process $candidate.element $candidate.hwnd) {
+            [void]$usable.Add([pscustomobject]@{
+                hwnd = $candidate.hwnd
+                element = $candidate.element
+                bounds = Get-WindowRectFrame $candidate.hwnd
+            })
+        }
+    }
+    if ($usable.Count -ne 1) {
+        throw "No usable top-level interactive window is available for the requested app."
+    }
+    return $usable[0]
 }
 
 function Test-HwndDescendantOf([IntPtr]$rootHwnd, [IntPtr]$candidateHwnd) {
@@ -1214,37 +1342,15 @@ function Resolve-App([string]$query) {
 }
 
 function Get-MainElement($process) {
-    if ($process.MainWindowHandle -ne 0) {
-        return [Windows.Automation.AutomationElement]::FromHandle([IntPtr]$process.MainWindowHandle)
-    }
-    $condition = New-Object Windows.Automation.PropertyCondition ([Windows.Automation.AutomationElement]::ProcessIdProperty), $process.Id
-    $children = [Windows.Automation.AutomationElement]::RootElement.FindAll([Windows.Automation.TreeScope]::Children, $condition)
-    if ($children.Count -gt 0) {
-        return $children.Item(0)
-    }
-    $processName = $process.ProcessName
-    throw "No top-level UI Automation window is available for ${processName}. Run the Windows runtime in the signed-in desktop session."
+    return (Resolve-InteractiveWindowTarget $process).element
 }
 
 function Get-WindowBounds($process, $element, [IntPtr]$expectedHwnd = [IntPtr]::Zero) {
-    $hwnd = $expectedHwnd
-    if ($hwnd -eq [IntPtr]::Zero) {
-        $hwnd = [IntPtr]$process.MainWindowHandle
+    $target = Resolve-InteractiveWindowTarget $process
+    if ($expectedHwnd -ne [IntPtr]::Zero -and $target.hwnd -ne $expectedHwnd) {
+        Throw-TargetChanged
     }
-    if ($hwnd -ne [IntPtr]::Zero) {
-        $fromWin32 = Get-WindowRectFrame $hwnd
-        if ($null -ne $fromWin32) {
-            return $fromWin32
-        }
-    }
-    try {
-        $rect = $element.Current.BoundingRectangle
-        if (-not $rect.IsEmpty -and $rect.Width -gt 0 -and $rect.Height -gt 0) {
-            return New-Frame $rect.X $rect.Y $rect.Width $rect.Height
-        }
-    } catch {
-    }
-    return $null
+    return $target.bounds
 }
 
 function Get-PatternNames($element) {
@@ -1611,15 +1717,7 @@ function Get-SelectedText($processId, $TextLimit = $script:DefaultTextLimit) {
 }
 
 function Get-ProcessTargetHandle($process, $element) {
-    $mainHwnd = [IntPtr]$process.MainWindowHandle
-    if (Test-HwndOwnedByProcess $mainHwnd $process) {
-        return $mainHwnd
-    }
-    $elementHwnd = Get-NativeWindowHandle $element
-    if (Test-HwndOwnedByProcess $elementHwnd $process) {
-        return $elementHwnd
-    }
-    return [IntPtr]::Zero
+    try { return (Resolve-InteractiveWindowTarget $process).hwnd } catch { return [IntPtr]::Zero }
 }
 
 function Assert-SnapshotCaptureTarget($process, [IntPtr]$expectedHwnd, [int64]$expectedStartTimeTicks, $expectedBounds) {
@@ -1627,56 +1725,29 @@ function Assert-SnapshotCaptureTarget($process, [IntPtr]$expectedHwnd, [int64]$e
         Throw-TargetChanged
     }
     try {
-        if ((Get-ProcessStartTimeTicks $process) -ne $expectedStartTimeTicks) {
-            Throw-TargetChanged
-        }
-        if (-not [OCUWin32]::IsWindow($expectedHwnd) -or -not (Test-HwndOwnedByProcess $expectedHwnd $process)) {
-            Throw-TargetChanged
-        }
-        $currentElement = Get-MainElement $process
-        $currentHwnd = Get-ProcessTargetHandle $process $currentElement
-        if ($currentHwnd -eq [IntPtr]::Zero -or $currentHwnd -ne $expectedHwnd) {
-            Throw-TargetChanged
-        }
-        $currentBounds = Get-WindowRectFrame $expectedHwnd
-        Assert-ValidFrame $currentBounds "Target changed; call get_app_state again." $true
+        if ((Get-ProcessStartTimeTicks $process) -ne $expectedStartTimeTicks) { Throw-TargetChanged }
+        $target = Resolve-InteractiveWindowTarget $process
+        if ($target.hwnd -ne $expectedHwnd -or $null -eq $target.bounds) { Throw-TargetChanged }
+        Assert-ValidFrame $target.bounds "Target changed; call get_app_state again." $true
         if ($null -ne $expectedBounds) {
             Assert-ValidFrame $expectedBounds "Target changed; call get_app_state again." $true
-            $components = @(
-                [pscustomobject]@{ expected = [double]$expectedBounds.x; actual = [double]$currentBounds.x },
-                [pscustomobject]@{ expected = [double]$expectedBounds.y; actual = [double]$currentBounds.y },
-                [pscustomobject]@{ expected = [double]$expectedBounds.width; actual = [double]$currentBounds.width },
-                [pscustomobject]@{ expected = [double]$expectedBounds.height; actual = [double]$currentBounds.height }
-            )
-            foreach ($component in $components) {
-                if ([math]::Abs($component.expected - $component.actual) -gt 0) {
-                    Throw-TargetChanged
-                }
-            }
+            if (-not (Test-FramesMatch $target.bounds $expectedBounds 1)) { Throw-TargetChanged }
         }
-        return $currentBounds
+        return $target.bounds
     } catch {
-        if ($PSItem.Exception.Message -eq "Target changed; call get_app_state again.") {
-            throw
-        }
+        if ($PSItem.Exception.Message -eq "Target changed; call get_app_state again.") { throw }
         Throw-TargetChanged
     }
 }
 
 function Build-SnapshotForProcess($process, [string]$query, $TextLimit = $script:DefaultTextLimit, [int]$MaxTreeNodes = $script:AccessibilityTreeMaxNodeCount, [int]$MaxTreeDepth = $script:AccessibilityTreeMaxDepth, [bool]$IncludeImage = $false, [IntPtr]$ExpectedHwnd = [IntPtr]::Zero, [int64]$ExpectedStartTimeTicks = 0) {
-    $element = Get-MainElement $process
-    $targetHwnd = Get-ProcessTargetHandle $process $element
-    if ($targetHwnd -eq [IntPtr]::Zero) {
-        Throw-TargetChanged
-    }
+    $target = Resolve-InteractiveWindowTarget $process
+    $element = $target.element
+    $targetHwnd = $target.hwnd
     $startTimeTicks = Get-ProcessStartTimeTicks $process
-    if ($ExpectedHwnd -ne [IntPtr]::Zero -and $targetHwnd -ne $ExpectedHwnd) {
-        Throw-TargetChanged
-    }
-    if ($ExpectedStartTimeTicks -gt 0 -and $startTimeTicks -ne $ExpectedStartTimeTicks) {
-        Throw-TargetChanged
-    }
-    $bounds = Get-WindowBounds $process $element $targetHwnd
+    if ($ExpectedHwnd -ne [IntPtr]::Zero -and $targetHwnd -ne $ExpectedHwnd) { Throw-TargetChanged }
+    if ($ExpectedStartTimeTicks -gt 0 -and $startTimeTicks -ne $ExpectedStartTimeTicks) { Throw-TargetChanged }
+    $bounds = $target.bounds
     $rendered = Render-Tree $element $bounds $TextLimit $MaxTreeNodes $MaxTreeDepth
     [pscustomobject]@{
         app = [pscustomobject]@{
@@ -2208,7 +2279,6 @@ function Invoke-TypeText($process, [IntPtr]$rootHwnd, [string]$text) {
             return $true
         }
         if ($nativeResult.attempted) {
-            throw $TypeTextDeliveryError
         }
     }
     return Invoke-FocusedValuePatternText $process $rootHwnd $text $target.element
@@ -2226,6 +2296,7 @@ function Get-BoundedRuntimeError($exception) {
     }
 
     $known = @(
+        "No usable top-level interactive window is available for the requested app.",
         "Target changed; call get_app_state again.",
         "Click requires an element with a valid frame or explicit finite x/y coordinates.",
         "Scroll requires an element with a valid frame when ScrollPattern is unavailable.",

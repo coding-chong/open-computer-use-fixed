@@ -56,12 +56,16 @@ func TestWindowsFixtureIdentityAndBoundsSmoke(t *testing.T) {
 		}
 	}()
 
-	start := func(instance string, left, top int) (*fixtureState, *os.Process) {
+	start := func(instance string, left, top int, allowOffscreen bool) (*fixtureState, *os.Process) {
 		readyPath := filepath.Join(runDir, instance+"-ready.json")
 		statePath := filepath.Join(runDir, instance+"-state.json")
-		cmd := exec.Command("pwsh.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", fixturePath,
+		args := []string{"-NoProfile", "-ExecutionPolicy", "Bypass", "-File", fixturePath,
 			"-InstanceName", instance, "-ReadyPath", readyPath, "-StatePath", statePath,
-			"-Left", fmt.Sprintf("%d", left), "-Top", fmt.Sprintf("%d", top))
+			"-Left", fmt.Sprintf("%d", left), "-Top", fmt.Sprintf("%d", top)}
+		if allowOffscreen {
+			args = append(args, "-AllowOffscreenPlacement")
+		}
+		cmd := exec.Command("pwsh.exe", args...)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		if err := cmd.Start(); err != nil {
@@ -72,8 +76,14 @@ func TestWindowsFixtureIdentityAndBoundsSmoke(t *testing.T) {
 		return state, cmd.Process
 	}
 
-	stateA, _ := start("A", 20, 20)
-	stateB, _ := start("B", 1280, 20)
+	stateA, _ := start("A", 20, 20, false)
+	stateB, _ := start("B", 20, 20, false)
+	proxyState, _ := start("Proxy", -14222, -14222, true)
+	proxyResult := newService().getAppState(proxyState.Title, nil, nil, nil, true)
+	if !proxyResult.IsError || len(proxyResult.Content) == 0 || proxyResult.Content[0].Text != "No usable top-level interactive window is available for the requested app." {
+		t.Fatalf("off-screen proxy fixture was accepted: %+v", proxyResult)
+	}
+
 	if stateA.PID == stateB.PID || stateA.HWND == stateB.HWND {
 		t.Fatalf("fixtures did not receive distinct identities: A=%+v B=%+v", stateA, stateB)
 	}
