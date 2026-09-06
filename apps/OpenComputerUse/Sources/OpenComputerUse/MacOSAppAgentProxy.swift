@@ -67,7 +67,11 @@ enum MacOSAppAgentProxy {
 
     private static func defaultSocketPath() -> String {
         FileManager.default.temporaryDirectory
-            .appendingPathComponent("open-computer-use-agent.sock")
+            .appendingPathComponent(
+                openComputerUseAppAgentSocketFileName(
+                    namespace: ProcessInfo.processInfo.environment[openComputerUseAppAgentSocketNamespaceEnvironmentKey]
+                )
+            )
             .standardizedFileURL
             .path
     }

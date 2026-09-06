@@ -1,9 +1,16 @@
 # 功能发布记录
 
+## 2026-09
+
+| 日期 | 功能域 | 用户价值 | 变更摘要 |
+| --- | --- | --- | --- |
+| 2026-09-01 | 内嵌 App Agent Socket 隔离 | 使用内嵌 OCU 的宿主不会再与用户全局 OCU 争用同一个 App Agent Socket，避免一个实例意外终止或替换另一个实例。 | 发布 `0.3.3`，为显式配置 namespace 的宿主生成确定性、短且不泄露原值的 Socket 文件名；未配置时继续兼容旧路径。 |
+
 ## 2026-08
 
 | 日期 | 功能域 | 用户价值 | 变更摘要 |
 | --- | --- | --- | --- |
+| 2026-08-29 | 跨平台文本与 Web 链接动作 | Linux 用户在 Ubuntu 24.04 等环境中可稳定使用文本操作；Chrome / BOSS 中的导航链接也能保持独立定位与点击。 | 发布 `0.3.2`，通过标准 AT-SPI 接口检测文本能力，并保留带 URL 的 Web 链接动作节点，避免父级通用动作吞掉链接语义。 |
 | 2026-08-08 | Linux AT-SPI 文本能力检测 | Ubuntu 24.04 等 PyGObject 环境中的 `get_app_state`、`type_text` 和 `set_value` 不再因缺少非标准 `Accessible.is_text` / `is_editable_text` 属性而崩溃。 | Linux bridge 改为通过标准 `Accessible.get_interfaces()` 检测 `Text` / `EditableText`，并新增不依赖真实桌面的 Python 回归测试。 |
 
 ## 2026-07

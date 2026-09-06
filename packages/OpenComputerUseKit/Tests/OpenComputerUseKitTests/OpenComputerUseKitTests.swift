@@ -4,6 +4,22 @@ import XCTest
 @testable import OpenComputerUseKit
 
 final class OpenComputerUseKitTests: XCTestCase {
+    func testAppAgentSocketFileNamePreservesLegacyDefault() {
+        XCTAssertEqual(openComputerUseAppAgentSocketFileName(namespace: nil), "open-computer-use-agent.sock")
+        XCTAssertEqual(openComputerUseAppAgentSocketFileName(namespace: "   "), "open-computer-use-agent.sock")
+    }
+
+    func testAppAgentSocketFileNameIsDeterministicAndNamespaced() {
+        let first = openComputerUseAppAgentSocketFileName(namespace: "boss-resume:profile-a")
+        let second = openComputerUseAppAgentSocketFileName(namespace: "boss-resume:profile-b")
+
+        XCTAssertEqual(first, openComputerUseAppAgentSocketFileName(namespace: "boss-resume:profile-a"))
+        XCTAssertNotEqual(first, second)
+        XCTAssertTrue(first.hasPrefix("open-computer-use-agent-"))
+        XCTAssertTrue(first.hasSuffix(".sock"))
+        XCTAssertLessThan(first.count, 80)
+    }
+
     func testCLIRecognizesGlobalHelpAndVersionFlags() throws {
         XCTAssertEqual(try parseOpenComputerUseCLI(arguments: ["-h"]), .help(command: nil))
         XCTAssertEqual(try parseOpenComputerUseCLI(arguments: ["--help"]), .help(command: nil))
@@ -568,7 +584,7 @@ final class OpenComputerUseKitTests: XCTestCase {
 
     func testInitializeResponseContainsToolsCapability() throws {
         let server = StdioMCPServer(service: ComputerUseService())
-        let response = server.handle(line: #"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","clientInfo":{"name":"test","version":"0.3.1"},"capabilities":{}}}"#)
+        let response = server.handle(line: #"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","clientInfo":{"name":"test","version":"0.3.3"},"capabilities":{}}}"#)
         XCTAssertNotNil(response)
         XCTAssertTrue(response!.contains(#""name":"open-computer-use""#))
         XCTAssertTrue(response!.contains(#""tools":{"listChanged":false}"#))
@@ -577,7 +593,7 @@ final class OpenComputerUseKitTests: XCTestCase {
     func testInitializeResponseContainsComputerUseInstructions() throws {
         let server = StdioMCPServer(service: ComputerUseService())
         let response = try XCTUnwrap(
-            server.handle(line: #"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","clientInfo":{"name":"test","version":"0.3.1"},"capabilities":{}}}"#)
+            server.handle(line: #"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","clientInfo":{"name":"test","version":"0.3.3"},"capabilities":{}}}"#)
         )
         let data = try XCTUnwrap(response.data(using: .utf8))
         let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
@@ -1117,6 +1133,12 @@ final class OpenComputerUseKitTests: XCTestCase {
             role: kAXGroupRole as String,
             hasPrimaryClickAction: true,
             localFrame: CGRect(x: 10, y: 10, width: 240, height: 120)
+        ))
+        XCTAssertFalse(shouldRenderCompactGenericActionTarget(
+            role: kAXGroupRole as String,
+            hasPrimaryClickAction: true,
+            localFrame: CGRect(x: 10, y: 10, width: 117, height: 35),
+            hasActionableLinkDescendant: true
         ))
         XCTAssertFalse(shouldRenderCompactGenericActionTarget(
             role: kAXButtonRole as String,

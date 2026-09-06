@@ -703,20 +703,33 @@ private struct TreeRenderer {
         let placeholder = placeholderValue(of: root, textLimit: context.textLimit)
         let webAreaDepth = webAreaDepth(role: role, ancestors: ancestors)
         let localFrame = resolveLocalFrame(of: root, windowBounds: context.windowBounds)
+        let rowTexts = role == kAXRowRole as String ? flattenedRowTexts(of: root, textLimit: context.textLimit) : []
+        let childElements = children(of: root)
+        let hasActionableLinkDescendant =
+            (role == kAXGroupRole as String || role == kAXUnknownRole as String)
+            && exposesPrimaryClickAction
+            && containsActionableLinkDescendant(
+                in: childElements,
+                textLimit: context.textLimit
+            )
         let rendersCompactGenericActionTarget = shouldRenderCompactGenericActionTarget(
             role: role,
             hasPrimaryClickAction: exposesPrimaryClickAction,
-            localFrame: localFrame
+            localFrame: localFrame,
+            hasActionableLinkDescendant: hasActionableLinkDescendant
         )
-        let rowTexts = role == kAXRowRole as String ? flattenedRowTexts(of: root, textLimit: context.textLimit) : []
-        let childElements = children(of: root)
-        let genericTextSummary = summarizedGenericText(
-            of: root,
-            role: role,
-            childElements: childElements,
-            textLimit: context.textLimit,
-            minimumTextCount: rendersCompactGenericActionTarget ? 1 : 2
-        )
+        let genericTextSummary: String?
+        if hasActionableLinkDescendant {
+            genericTextSummary = nil
+        } else {
+            genericTextSummary = summarizedGenericText(
+                of: root,
+                role: role,
+                childElements: childElements,
+                textLimit: context.textLimit,
+                minimumTextCount: rendersCompactGenericActionTarget ? 1 : 2
+            )
+        }
         let summaryImageChildren = genericTextSummary == nil ? [] : summaryImageDescendants(of: root)
         let rendersSummaryAsChildren = !rendersCompactGenericActionTarget
             && shouldRenderGenericTextSummaryAsChildren(
@@ -935,6 +948,42 @@ private struct TreeRenderer {
         }
 
         return children
+    }
+
+    private func containsActionableLinkDescendant(
+        in elements: [AXUIElement],
+        textLimit: SnapshotTextLimit,
+        ancestors: [AXUIElement] = [],
+        depth: Int = 0
+    ) -> Bool {
+        guard depth < 8 else {
+            return false
+        }
+
+        for element in elements {
+            guard !ancestors.contains(where: { CFEqual($0, element) }) else {
+                continue
+            }
+
+            let role = stringValue(of: element, attribute: kAXRoleAttribute) ?? ""
+            if role == "AXLink",
+               let url = urlValue(of: element, attribute: kAXURLAttribute, textLimit: textLimit),
+               !url.isEmpty
+            {
+                return true
+            }
+
+            if containsActionableLinkDescendant(
+                in: children(of: element),
+                textLimit: textLimit,
+                ancestors: ancestors + [element],
+                depth: depth + 1
+            ) {
+                return true
+            }
+        }
+
+        return false
     }
 }
 
@@ -1506,9 +1555,16 @@ func hasPrimaryClickAction(_ actions: [String]) -> Bool {
 func shouldRenderCompactGenericActionTarget(
     role: String,
     hasPrimaryClickAction: Bool,
-    localFrame: CGRect?
+    localFrame: CGRect?,
+    hasActionableLinkDescendant: Bool = false
 ) -> Bool {
     guard hasPrimaryClickAction else {
+        return false
+    }
+
+    // A URL-bearing AXLink is the navigation target. Do not hide it behind a
+    // generic action wrapper that happens to expose AXPress as well.
+    guard !hasActionableLinkDescendant else {
         return false
     }
 
