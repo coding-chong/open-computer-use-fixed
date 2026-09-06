@@ -2319,6 +2319,7 @@ function Invoke-TypeText($process, [IntPtr]$rootHwnd, [string]$text) {
             return $true
         }
         if ($nativeResult.attempted) {
+            throw $TypeTextDeliveryError
         }
     }
     return Invoke-FocusedValuePatternText $process $rootHwnd $text $target.element
