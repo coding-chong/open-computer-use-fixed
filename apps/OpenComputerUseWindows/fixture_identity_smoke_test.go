@@ -334,7 +334,8 @@ func waitForFixtureState(t *testing.T, readyPath, statePath, instance string) *f
 
 func waitForFixtureValue(t *testing.T, statePath string, predicate func(fixtureState) bool) *fixtureState {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
+	// Cold-start WPF fixture writes can exceed 10s; deadline only bounds failure detection.
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		state := readFixtureState(t, statePath)
 		if predicate(*state) {
