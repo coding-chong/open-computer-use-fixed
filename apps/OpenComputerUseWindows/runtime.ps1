@@ -1602,13 +1602,39 @@ function Test-BitmapHasVisiblePixels($bitmap) {
 }
 
 function Normalize-BitmapAlpha($bitmap) {
-    for ($y = 0; $y -lt $bitmap.Height; $y++) {
-        for ($x = 0; $x -lt $bitmap.Width; $x++) {
-            $pixel = $bitmap.GetPixel($x, $y)
-            if ($pixel.A -ne 255) {
-                $bitmap.SetPixel($x, $y, [System.Drawing.Color]::FromArgb(255, $pixel.R, $pixel.G, $pixel.B))
+    # Fast gate: sample a 32x32 grid. Screen copies are always fully opaque, so
+    # the common case skips the expensive full-surface scan entirely.
+    $stepX = [Math]::Max(1, [int]($bitmap.Width / 32))
+    $stepY = [Math]::Max(1, [int]($bitmap.Height / 32))
+    $needsNormalize = $false
+    for ($y = 0; $y -lt $bitmap.Height -and -not $needsNormalize; $y += $stepY) {
+        for ($x = 0; $x -lt $bitmap.Width; $x += $stepX) {
+            if ($bitmap.GetPixel($x, $y).A -ne 255) {
+                $needsNormalize = $true
+                break
             }
         }
+    }
+    if (-not $needsNormalize) {
+        return
+    }
+    # Slow path: batch-rewrite alpha through LockBits + Marshal.Copy instead of
+    # per-pixel GetPixel/SetPixel interop (1080p would be ~2M interop calls).
+    # Format32bppArgb is stored little-endian BGRA, so alpha lives at offset 3 mod 4.
+    $rect = New-Object System.Drawing.Rectangle 0, 0, $bitmap.Width, $bitmap.Height
+    $data = $bitmap.LockBits($rect, [System.Drawing.Imaging.ImageLockMode]::ReadWrite, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+    try {
+        $stride = $data.Stride
+        $bytes = New-Object byte[] ($stride * $bitmap.Height)
+        [System.Runtime.InteropServices.Marshal]::Copy($data.Scan0, $bytes, 0, $bytes.Length)
+        for ($offset = 3; $offset -lt $bytes.Length; $offset += 4) {
+            if ($bytes[$offset] -ne 255) {
+                $bytes[$offset] = 255
+            }
+        }
+        [System.Runtime.InteropServices.Marshal]::Copy($bytes, 0, $data.Scan0, $bytes.Length)
+    } finally {
+        $bitmap.UnlockBits($data)
     }
 }
 
