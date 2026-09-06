@@ -1684,6 +1684,20 @@ function Capture-WindowPngBase64($bounds, $hwnd, [bool]$IncludeImage, $process =
             } finally {
                 $graphics.ReleaseHdc($hdc)
             }
+            # GPU-composited windows (Chrome/Electron) often paint blank pixels
+            # with flags=0. Retry once with PW_RENDERFULLCONTENT (2) on the same
+            # bitmap before failing closed. The retry is still HWND-scoped, so
+            # the ownership/identity guards above are unchanged.
+            if (-not (Test-BitmapHasVisiblePixels $bitmap)) {
+                $captureBounds = Assert-SnapshotCaptureTarget $process $hwnd $ExpectedStartTimeTicks $bounds
+                $graphics.Clear([System.Drawing.Color]::Black)
+                $hdc = $graphics.GetHdc()
+                try {
+                    $captured = [OCUWin32]::PrintWindow([IntPtr]$hwnd, $hdc, 2)
+                } finally {
+                    $graphics.ReleaseHdc($hdc)
+                }
+            }
         }
         # A desktop rectangle is not an HWND-owned image. Never substitute it for a
         # background window when PrintWindow fails or returns blank pixels.
