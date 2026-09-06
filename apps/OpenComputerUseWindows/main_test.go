@@ -2104,7 +2104,17 @@ func TestWindowsNativeTextDeliveryChecksPostconditionWithoutFallback(t *testing.
 	if strings.Contains(helper, "$WM_SETTEXT") {
 		t.Fatal("native text failure must not retry through WM_SETTEXT")
 	}
-	if !strings.Contains(windowsRuntimeScript, "if ($nativeResult.attempted)") || !strings.Contains(windowsRuntimeScript, "throw $TypeTextDeliveryError") {
+	typeTextStart := strings.Index(windowsRuntimeScript, "function Invoke-TypeText")
+	if typeTextStart < 0 {
+		t.Fatal("type_text delivery implementation is missing")
+	}
+	typeTextEndOffset := strings.Index(windowsRuntimeScript[typeTextStart:], "function Get-BoundedRuntimeError")
+	if typeTextEndOffset < 0 {
+		t.Fatal("could not bound the type_text delivery implementation")
+	}
+	typeTextBody := windowsRuntimeScript[typeTextStart : typeTextStart+typeTextEndOffset]
+	attemptedBranch := strings.Index(typeTextBody, "if ($nativeResult.attempted) {")
+	if attemptedBranch < 0 || !strings.Contains(typeTextBody[attemptedBranch:], "throw $TypeTextDeliveryError") {
 		t.Fatal("type_text must fail after an attempted native mutation instead of invoking UIA fallback")
 	}
 }
