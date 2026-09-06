@@ -1964,6 +1964,91 @@ func TestWindowsRuntimeScreenshotFallbackFailsClosedForBackgroundWindows(t *test
 	}
 }
 
+func TestWindowsRuntimeBitmapAlphaNormalizationBatched(t *testing.T) {
+	start := strings.Index(windowsRuntimeScript, "function Normalize-BitmapAlpha")
+	if start < 0 {
+		t.Fatal("Normalize-BitmapAlpha function is missing")
+	}
+	endOffset := strings.Index(windowsRuntimeScript[start:], "function Capture-WindowPngBase64")
+	if endOffset < 0 {
+		t.Fatal("could not bound Normalize-BitmapAlpha function")
+	}
+	normalize := windowsRuntimeScript[start : start+endOffset]
+	for _, marker := range []string{
+		"$stepX = [Math]::Max(1, [int]($bitmap.Width / 32))",
+		"$stepY = [Math]::Max(1, [int]($bitmap.Height / 32))",
+		".GetPixel(",
+		"LockBits(",
+		"[System.Drawing.Imaging.ImageLockMode]::ReadWrite",
+		"[System.Drawing.Imaging.PixelFormat]::Format32bppArgb",
+		"[System.Runtime.InteropServices.Marshal]::Copy",
+		"UnlockBits(",
+	} {
+		if !strings.Contains(normalize, marker) {
+			t.Fatalf("bitmap alpha normalization contract missing %q", marker)
+		}
+	}
+	if strings.Count(normalize, ".GetPixel(") != 1 {
+		t.Fatalf("alpha normalization must only sample pixels through the 32x32 gate: %q", normalize)
+	}
+	if strings.Contains(normalize, ".SetPixel(") {
+		t.Fatal("alpha normalization must not rewrite pixels through per-pixel SetPixel interop")
+	}
+	if strings.Count(normalize, "[System.Runtime.InteropServices.Marshal]::Copy") < 2 {
+		t.Fatal("alpha normalization must copy the buffer in and back out via Marshal.Copy")
+	}
+	lockBits := strings.Index(normalize, "LockBits(")
+	unlockBits := strings.Index(normalize, "UnlockBits(")
+	if lockBits < 0 || unlockBits < 0 || unlockBits < lockBits {
+		t.Fatal("alpha normalization must lock the bitmap bits before unlocking them")
+	}
+	finally := strings.Index(normalize[lockBits:], "} finally {")
+	if finally < 0 || unlockBits <= lockBits+finally {
+		t.Fatal("alpha normalization must unlock the bitmap bits in a finally block")
+	}
+}
+
+func TestWindowsRuntimePrintWindowRenderFullContentRetry(t *testing.T) {
+	start := strings.Index(windowsRuntimeScript, "function Capture-WindowPngBase64")
+	if start < 0 {
+		t.Fatal("screenshot capture function is missing")
+	}
+	endOffset := strings.Index(windowsRuntimeScript[start:], "function Get-FocusedSummary")
+	if endOffset < 0 {
+		t.Fatal("could not bound screenshot capture function")
+	}
+	capture := windowsRuntimeScript[start : start+endOffset]
+	flagsZero := strings.Index(capture, "[OCUWin32]::PrintWindow([IntPtr]$hwnd, $hdc, 0)")
+	renderFullContent := strings.Index(capture, "[OCUWin32]::PrintWindow([IntPtr]$hwnd, $hdc, 2)")
+	failClosed := strings.Index(capture, "if (-not $captured -or -not (Test-BitmapHasVisiblePixels $bitmap))")
+	if flagsZero < 0 {
+		t.Fatal("background capture must first attempt PrintWindow with flags=0")
+	}
+	if renderFullContent < 0 {
+		t.Fatal("background capture must retry once with PW_RENDERFULLCONTENT (flags=2)")
+	}
+	if failClosed < 0 {
+		t.Fatal("background capture must keep the fail-closed fallback check")
+	}
+	if !(flagsZero < renderFullContent && renderFullContent < failClosed) {
+		t.Fatalf("PrintWindow retry ordering violated: flags=0 at %d, flags=2 at %d, fail-closed at %d", flagsZero, renderFullContent, failClosed)
+	}
+	if strings.Count(capture, "Assert-SnapshotCaptureTarget $process $hwnd $ExpectedStartTimeTicks $bounds") < 2 {
+		t.Fatal("PrintWindow retry must revalidate the capture target identity before repainting")
+	}
+	if !strings.Contains(capture, "$graphics.Clear([System.Drawing.Color]::Black)") {
+		t.Fatal("PrintWindow retry must reset the shared bitmap to black before repainting")
+	}
+	if strings.Count(capture, "CopyFromScreen") != 1 {
+		t.Fatalf("retry path must not introduce additional desktop copies: %q", capture)
+	}
+	for _, forbidden := range []string{"CreateDC", "\"Screen\"", "GetDesktopWindow"} {
+		if strings.Contains(capture, forbidden) {
+			t.Fatalf("background capture must stay HWND-scoped and fail closed, found %q", forbidden)
+		}
+	}
+}
+
 func TestWindowsNativeTextDeliveryChecksPostconditionWithoutFallback(t *testing.T) {
 	start := strings.Index(windowsRuntimeScript, "function Send-TextToEditHandle")
 	if start < 0 {
