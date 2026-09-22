@@ -2089,7 +2089,7 @@ function Invoke-Scroll($element, [string]$direction, [double]$pages) {
 
 # type_text has no element record; the action-time focused element is its only implicit target.
 # Keep this boundary separate from the snapshot element resolver used by set_value and other indexed actions.
-$TypeTextTargetError = 'type_text requires a focused writable text control owned by the requested app/window; click/select the field first or use set_value with the complete generation-bound identifier in element_index.'
+$TypeTextTargetError = 'type_text requires a focused writable text control owned by the requested app/window; click/select the field first or use set_value with the complete generation-bound identifier in element_index. When the target exposes no such control (a Chromium/Electron content area has no actionable nodes), focus the field and use press_key, which needs OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT=1 and a target that already owns the foreground.'
 $TypeTextFallbackError = 'The focused text control has no usable native edit handle; UIA ValuePattern text fallback is disabled by default; set OPEN_COMPUTER_USE_WINDOWS_ALLOW_UIA_TEXT_FALLBACK=1 or use set_value with the complete generation-bound identifier in element_index.'
 $TypeTextDeliveryError = 'type_text could not write to the focused text control; click/select the field again or use set_value with the complete generation-bound identifier in element_index.'
 
@@ -2341,7 +2341,7 @@ function Get-BoundedRuntimeError($exception) {
         "Target changed; call get_app_state again.",
         "Click requires an element with a valid frame or explicit finite x/y coordinates.",
         "Scroll requires an element with a valid frame when ScrollPattern is unavailable.",
-        "type_text requires a focused writable text control owned by the requested app/window; click/select the field first or use set_value with the complete generation-bound identifier in element_index.",
+        "type_text requires a focused writable text control owned by the requested app/window; click/select the field first or use set_value with the complete generation-bound identifier in element_index. When the target exposes no such control (a Chromium/Electron content area has no actionable nodes), focus the field and use press_key, which needs OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT=1 and a target that already owns the foreground.",
         "The focused text control has no usable native edit handle; UIA ValuePattern text fallback is disabled by default; set OPEN_COMPUTER_USE_WINDOWS_ALLOW_UIA_TEXT_FALLBACK=1 or use set_value with the complete generation-bound identifier in element_index.",
         "type_text could not write to the focused text control; click/select the field again or use set_value with the complete generation-bound identifier in element_index.",
         "Interactive Windows input is disabled by default; set OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT=1 to enable it.",

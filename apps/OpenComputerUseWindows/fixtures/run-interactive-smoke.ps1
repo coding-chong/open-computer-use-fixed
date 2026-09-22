@@ -68,7 +68,7 @@ function Test-MissingClickFrameResponse($response) {
 }
 
 function Test-TypeTextTargetResponse($response) {
-    return ($null -ne $response -and -not $response.ok -and $response.error -eq 'type_text requires a focused writable text control owned by the requested app/window; click/select the field first or use set_value with the complete generation-bound identifier in element_index.')
+    return ($null -ne $response -and -not $response.ok -and $response.error -eq 'type_text requires a focused writable text control owned by the requested app/window; click/select the field first or use set_value with the complete generation-bound identifier in element_index. When the target exposes no such control (a Chromium/Electron content area has no actionable nodes), focus the field and use press_key, which needs OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT=1 and a target that already owns the foreground.')
 }
 
 function Test-TypeTextFallbackResponse($response) {

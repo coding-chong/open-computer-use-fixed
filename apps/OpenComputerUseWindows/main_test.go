@@ -1243,6 +1243,19 @@ func TestBoundedRuntimeErrorsNeverExposeDiagnostics(t *testing.T) {
 	}
 }
 
+func TestTypeTextTargetErrorStaysActionableAcrossBoundaries(t *testing.T) {
+	const message = "type_text requires a focused writable text control owned by the requested app/window; click/select the field first or use set_value with the complete generation-bound identifier in element_index. When the target exposes no such control (a Chromium/Electron content area has no actionable nodes), focus the field and use press_key, which needs OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT=1 and a target that already owns the foreground."
+	if len(message) > 512 {
+		t.Fatalf("type_text target error exceeds the 512-byte response bound: %d", len(message))
+	}
+	if count := strings.Count(windowsRuntimeScript, message); count != 2 {
+		t.Fatalf("runtime must carry the type_text target error in both the constant and the bounded-error list, got %d", count)
+	}
+	if got := boundedRuntimeError(message); got != message {
+		t.Fatalf("type_text target error was sanitized at the Go boundary: %q", got)
+	}
+}
+
 func TestMCPToolsCallRejectsMalformedParams(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -1651,6 +1664,22 @@ func TestWindowsRuntimeForegroundActionsRequireOptIn(t *testing.T) {
 	} {
 		if !strings.Contains(serverInstructions, marker) {
 			t.Fatalf("MCP instructions must document the type_text focus contract %q", marker)
+		}
+	}
+}
+
+func TestServerInstructionsDocumentChromiumCoordinateBoundary(t *testing.T) {
+	for _, phrase := range []string{
+		"Chromium/Electron content area",
+		"topmost window at that exact point",
+		"Occlusion is invisible in a capture",
+		"physical pixels of the snapshot image",
+		"foreground lock",
+		"`press_key` is the only way to enter text",
+		"prefer writing that file",
+	} {
+		if !strings.Contains(serverInstructions, phrase) {
+			t.Fatalf("MCP instructions must document the Chromium coordinate boundary %q", phrase)
 		}
 	}
 }
