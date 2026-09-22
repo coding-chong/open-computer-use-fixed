@@ -17,6 +17,7 @@ app:
 
 test:
 	swift test
+	node --test scripts/node-repl/open-computer-use-repl.test.mjs
 
 smoke:
 	./scripts/run-tool-smoke-tests.sh

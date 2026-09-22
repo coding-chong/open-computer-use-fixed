@@ -1,7 +1,7 @@
 {
   "name": "open-computer-use",
   "version": "0.3.5",
-  "description": "Open-source cross-platform Computer Use MCP server packaged as a Codex plugin.",
+  "description": "Open-source cross-platform Computer Use with a persistent JavaScript REPL.",
   "author": {
     "name": "Leo",
     "url": "https://github.com/iFurySt"
@@ -20,7 +20,7 @@
   "interface": {
     "displayName": "Open Computer Use",
     "shortDescription": "Control desktop apps from Codex with the open local server",
-    "longDescription": "Open Computer Use packages this repository's open-source desktop automation server as a Codex plugin. It exposes the same nine desktop-control MCP tools through a local macOS app bundle or Linux / Windows native binary, with semantic accessibility paths preferred before fallback input.",
+    "longDescription": "Open Computer Use packages this repository's open-source desktop automation server as a Codex plugin. The model-facing surface is a persistent Node.js REPL with js and js_reset, while the adapter composes the native accessibility and input actions through an asynchronous cua API on macOS, Linux, and Windows.",
     "developerName": "Leo",
     "category": "Productivity",
     "capabilities": [
@@ -34,11 +34,12 @@
     "defaultPrompt": [
       "Inspect the current UI state of this desktop app without stealing focus when possible",
       "Open a new local document with keyboard shortcuts first, then type content without moving my real pointer unless required",
-      "Drive the fixture app and verify the nine computer-use tools still behave correctly"
+      "Drive the fixture app with JavaScript and verify a multi-step flow in one call"
     ],
     "brandColor": "#0E7490",
     "composerIcon": "./assets/open-computer-use-small.svg",
     "logo": "./assets/open-computer-use.svg",
     "screenshots": []
-  }
+  },
+  "bundledContentVariant": "node-repl"
 }

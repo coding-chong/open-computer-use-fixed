@@ -562,6 +562,14 @@ function copyInstallerScripts(packageRoot) {
   cpSync(path.join(repoRoot, "scripts", "install-dsh-mcp.sh"), path.join(packageRoot, "scripts", "install-dsh-mcp.sh"));
   cpSync(path.join(repoRoot, "scripts", "install-codex-plugin.sh"), path.join(packageRoot, "scripts", "install-codex-plugin.sh"));
   cpSync(path.join(repoRoot, "skills", "open-computer-use"), path.join(packageRoot, "skills", "open-computer-use"), { recursive: true });
+  cpSync(
+    path.join(repoRoot, "scripts", "node-repl", "open-computer-use-repl.mjs"),
+    path.join(packageRoot, "plugins", "open-computer-use", "scripts", "open-computer-use-repl.mjs")
+  );
+  cpSync(
+    path.join(repoRoot, "scripts", "node-repl", "open-computer-use-kernel.mjs"),
+    path.join(packageRoot, "plugins", "open-computer-use", "scripts", "open-computer-use-kernel.mjs")
+  );
 
   for (const scriptName of [
     "install-claude-mcp.sh",
