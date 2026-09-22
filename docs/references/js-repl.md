@@ -67,7 +67,10 @@ Top-level bindings persist across calls. Prefer `var` for reusable names, or use
 REPL does not close applications or erase their UI state.
 
 A thrown exception ends the `js` call with `isError: true` and the message;
-bindings survive. Only a timeout resets the session.
+bindings survive. Only a timeout resets the session. Errors and output belong to
+the call whose code produced them: a timer or promise callback from a call that
+has already returned cannot fail or write into a later call; its late error is
+dropped.
 
 ## Read-back
 

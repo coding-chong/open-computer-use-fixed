@@ -125,6 +125,23 @@ test("thrown errors settle the call and keep bindings", async () => {
   assert.equal(result.content.at(-1).text, "1");
 });
 
+for (const Session of [PersistentJavaScriptSession, WorkerJavaScriptSession]) {
+  test(`${Session.name}: a late throw from a finished call does not reach the next call`, async () => {
+    const session = new Session({ native: mockNative() });
+    try {
+      let result = await session.run(`var kept = 1; setTimeout(() => { throw new Error("late"); }, 20);
+        setTimeout(() => nodeRepl.write("late write"), 20);`, 1000);
+      assert.equal(result.isError, false);
+      result = await session.run(`await new Promise(resolve => setTimeout(resolve, 100)); nodeRepl.write("next " + kept);`, 1000);
+      assert.deepEqual(result, { content: [{ type: "text", text: "next 1" }], isError: false });
+      result = await session.run(`nodeRepl.write("after");`, 1000);
+      assert.deepEqual(result, { content: [{ type: "text", text: "after" }], isError: false });
+    } finally {
+      await session.close?.();
+    }
+  });
+}
+
 test("screenshots emit binary image content", async () => {
   const session = new PersistentJavaScriptSession({ native: mockNative() });
   const result = await session.run(`

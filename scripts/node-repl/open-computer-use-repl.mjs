@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { existsSync, realpathSync } from "node:fs";
@@ -10,6 +11,9 @@ import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 
 const require = createRequire(import.meta.url);
+// The js call whose code is running. Timers and promises carry it, so a callback
+// scheduled by a finished call still names that call, not the one running now.
+const evaluationOwner = new AsyncLocalStorage();
 const repl = require("node:repl");
 const { PassThrough } = require("node:stream");
 
@@ -326,8 +330,9 @@ export class PersistentJavaScriptSession {
   }
 
   #currentOutput() {
-    if (!this.active) throw new Error("nodeRepl output is only available while js is executing");
-    return this.active;
+    const owner = evaluationOwner.getStore();
+    if (!owner || owner !== this.active) throw new Error("nodeRepl output is only available while js is executing");
+    return owner;
   }
 
   reset() {
@@ -336,10 +341,14 @@ export class PersistentJavaScriptSession {
     const output = new PassThrough();
     output.resume();
     // A throw inside evaluated code (sync, or after an await) never reaches the eval
-    // callback: the REPL prints it and moves on. Settle the active evaluation from the
-    // REPL's error path instead. Node 26 exposes `handleError`; Node 22 routes through
-    // a domain.
-    const settle = error => { this.rejectActive?.(error); return "ignore"; };
+    // callback: the REPL prints it and moves on. Settle the evaluation from the REPL's
+    // error path instead (`handleError` on Node 26, a domain on Node 22), but only the
+    // call that threw: a late throw from a finished call is dropped, as the REPL would.
+    const settle = error => {
+      const owner = evaluationOwner.getStore();
+      if (owner && owner === this.active) owner.reject(error);
+      return "ignore";
+    };
     this.repl = repl.start({ prompt: "", input, output, terminal: false, useGlobal: false, ignoreUndefined: true, breakEvalOnSigint: true, handleError: settle });
     this.repl.on("error", () => {});
     this.repl._domain?.on("error", settle);
@@ -370,8 +379,8 @@ export class PersistentJavaScriptSession {
     const enforceTimeout = Number.isFinite(timeoutMs) && timeoutMs > 0;
     try {
       const evaluation = new Promise((resolve, reject) => {
-        this.rejectActive = reject;
-        this.repl.eval(code, this.repl.context, "open-computer-use-repl", (error, result) => error ? reject(error) : resolve(result));
+        active.reject = reject;
+        evaluationOwner.run(active, () => this.repl.eval(code, this.repl.context, "open-computer-use-repl", (error, result) => error ? reject(error) : resolve(result)));
       });
       const value = enforceTimeout
         ? await Promise.race([evaluation, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`js execution timed out after ${timeoutMs} ms; session reset`)), timeoutMs); })])
@@ -386,7 +395,6 @@ export class PersistentJavaScriptSession {
     } finally {
       clearTimeout(timer);
       this.active = null;
-      this.rejectActive = null;
     }
   }
 }
