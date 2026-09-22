@@ -41,6 +41,36 @@ press_key
 set_value
 ```
 
+This remains the native compatibility surface. The bundled Codex plugin uses a
+code-first adapter instead and advertises only `js` and `js_reset`. In that
+surface, bind an app and compose actions with asynchronous JavaScript:
+
+```js
+var app = await cua.getApp("TextEdit");
+await app.typeText("Hello");
+await app.getAXState();
+```
+
+Bindings persist across `js` calls until `js_reset`. See
+`docs/references/js-repl.md` for the full API and security boundary.
+
+The npm CLI can use the same code-first runtime without an MCP host:
+
+```sh
+ocu capabilities
+ocu js 'var apps = await cua.listApps({ emit: false }); nodeRepl.write(apps)'
+printf '%s' 'nodeRepl.write(6 * 7)' | ocu js -
+ocu js --file ./automation.mjs
+ocu repl
+```
+
+`ocu js` owns one short-lived Worker/native MCP session. `ocu repl` keeps the
+session and top-level bindings for the current terminal until `.exit`, Ctrl-D,
+or termination; `.editor` / `.end` accepts multiline input and `.reset`
+discards JavaScript bindings. Use `nodeRepl.write(value)` for explicit output.
+The native `ocu mcp` surface remains the nine tools listed above. Run
+`ocu capabilities --json` to inspect component availability instead of
+inferring support from a command being present in help.
 The Windows runtime additionally exposes `save_screenshot` for user-requested PNG export; it is not part of the common macOS/Linux list.
 
 ## Direct CLI Tool Calls
@@ -140,6 +170,17 @@ OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1 open-computer-use call click 
 Keep the environment override scoped as narrowly as possible. While it remains enabled, the existing `auto` route may also choose the global pointer path after accessibility cannot handle a click.
 
 Windows returns an unsupported error for `sky_click` and `global`; Linux returns an unsupported error for `app_post` and `sky_click`. An unsupported or failed explicit method does not fall back to `auto`.
+
+## Drag Delivery
+
+`drag` has no method parameter. On macOS the path it takes is decided by the same process-level gate that authorizes `click_method: "global"`:
+
+- Gate unset (default): mouse move / down / dragged / up events are posted directly to the target process with `CGEvent.postToPid`. The system pointer does not move and foreground focus is unchanged. Because the events never pass through the window server, this path cannot start a window-server drag session: window moves, drag-selecting text, and Finder drag-and-drop return without error but have no visible effect.
+- `OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1` set for the server process: the drag uses the global pointer path, which drives window-server drag sessions but may move the real pointer and change foreground focus.
+
+Every non-fixture `drag` result includes a text item that begins `Drag delivered via app_post` or `Drag delivered via global pointer path`, so a default drag that did nothing is legible instead of looking like success. For an MCP server the variable belongs in the server entry's `env`, not in the calling shell, and the server must be restarted afterwards.
+
+When the gate is not enabled, treat window-server drags as unavailable and reach the same outcome another way: copy or move files with a shell command instead of a Finder drag, use `set_value` or keyboard selection instead of drag-selecting text, and use the app's own window controls instead of dragging a title bar.
 
 ## Platform Notes
 

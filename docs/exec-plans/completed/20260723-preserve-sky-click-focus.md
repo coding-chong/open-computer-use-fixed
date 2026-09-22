@@ -19,7 +19,7 @@
 
 ## 背景
 
-- 相关文档：`docs/ARCHITECTURE.md`、`docs/RELIABILITY.md`、`docs/references/macos-skylight-background-click.md`。
+- 相关文档：`docs/ARCHITECTURE.md`、`docs/RELIABILITY.md`。
 - 相关代码路径：`SkyLightSPI.swift`、`SkyClickSimulation.swift`、`AccessibilitySnapshot.swift`、`ComputerUseService.click`、`SkyClickLiveTests.swift`。
 - 已知约束：`SLPSPostEventRecordTo` 是私有 SPI；Chromium renderer 仍需要短暂 synthetic focus 和 off-window primer；显式模式必须 fail closed。
 

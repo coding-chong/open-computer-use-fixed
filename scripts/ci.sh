@@ -7,6 +7,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 "${repo_root}/scripts/check-docs.sh"
 "${repo_root}/scripts/check-repo-hygiene.sh"
 "${repo_root}/scripts/check-action-pinning.sh"
+"${repo_root}/scripts/tests/install-dsh-mcp.test.sh"
 
 while IFS= read -r file; do
   bash -n "$file"
@@ -15,6 +16,8 @@ done < <(find "${repo_root}/scripts" -type f -name '*.sh' | sort)
 while IFS= read -r file; do
   node --check "$file"
 done < <(find "${repo_root}/scripts" -type f -name '*.mjs' | sort)
+
+node --test "${repo_root}"/scripts/node-repl/*.test.mjs
 
 (
   cd "${repo_root}/apps/OpenComputerUseLinux"

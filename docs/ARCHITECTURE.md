@@ -1,6 +1,6 @@
 # 架构总览
 
-这个仓库当前已经从模板收敛成一个本地 `computer-use` 项目。主线仍是 Swift 实现的 macOS automation MCP server，同时新增了实验性的 Windows 和 Linux runtime；macOS/Linux 保持公开的 9 个 Computer Use tools，Windows 在此基础上额外提供 `save_screenshot`，当前暴露 10 个 tools。
+这个仓库当前已经从模板收敛成一个本地 `computer-use` 项目。主线仍是 Swift 实现的 macOS automation MCP server，同时新增了实验性的 Windows 和 Linux runtime，用独立 Go 二进制暴露同一组 9 个 native Computer Use tools；Windows 在此基础上额外提供 `save_screenshot`，当前暴露 10 个 tools。Codex plugin 再在 native MCP 之上增加持久 Node.js REPL，向模型暴露 `js` / `js_reset`。
 
 ## 当前目录结构
 
@@ -27,7 +27,7 @@
 - `experiments/StandaloneCursor`
   新的独立 Swift cursor viewer，直接复用 `scripts/cursor-motion-re/official_cursor_motion.py` 里收敛出来的候选路径、score 与 raw spring timeline，用来观察更贴近 binary lift 的表现。
 - `scripts/`
-  仓库级自动化命令，包括 smoke test、`.app` 打包入口、Windows `.exe` / Linux binary 构建入口、npm 分发脚本，以及 `scripts/computer-use-cli/` 这个用于探测官方 bundled `computer-use` 的 Go helper。
+  仓库级自动化命令，包括 smoke test、`.app` 打包入口、Windows `.exe` / Linux binary 构建入口、npm 分发脚本、`scripts/node-repl/` 的 JS REPL adapter 与 npm CLI controller，以及 `scripts/computer-use-cli/` 这个用于探测官方 bundled `computer-use` 的 Go helper。
 - `skills/`
   面向 agent runtime 的可安装 skill。当前 `skills/open-computer-use/SKILL.md` 只作为轻量入口和目录，安装、MCP/CLI 使用、排障等细节拆到相邻 `references/` 文件里按需加载；`scripts/package-skill.sh` 负责校验并打包 `.zip` / `.skill` 制品。
 - `docs/`
@@ -64,8 +64,14 @@
 - `ComputerUseService` 负责把 Computer Use tool 请求映射到本地能力，`ComputerUseToolDispatcher` 则把公开 9 个 tool 的参数解析与 service 方法分发收敛成 MCP server 和 `open-computer-use call` 共用的一层；Windows runtime 另有自己的 10-tool dispatcher。
 - `list_apps` 通过 Spotlight metadata query 拉取标准 application 目录里的 app bundle，并读取 `kMDItemUseCount` / `kMDItemLastUsedDate_Ranking` 这类系统元数据；再与 `NSWorkspace` 的运行态 app 合并，输出“当前运行中 + 近 14 天用过”的视图。
 - `get_app_state` 优先走真实 AX / 窗口截图；真实 app 必须同时有未最小化的 `AXWindow` 和可匹配的 on-screen `CGWindow`。如果目标 app 只是隐藏或暂时没有 on-screen window，会先 best-effort unhide / activate / `open -b` / `AXRaise` 并短暂重试，以贴近官方 `computer-use` 会把 Lark / Electron 窗口拉回再采集的行为；恢复后仍无法匹配时返回官方风格的 `Apple event error -10005: cgWindowNotFound`，不再把 application 根节点或无截图窗口伪装成可操作状态。当目标是仓库内 fixture app 时，回退到 fixture 导出的合成状态。真实 AX tree 默认在 macOS、Linux、Windows 上最多渲染 1200 个节点、64 层深度；显式 `get_app_state` / `snapshot` 可通过 `max_tree_nodes` / `max_tree_depth` 覆盖预算，action tools 的刷新结果仍使用默认预算。snapshot 文本默认截断到 500 字符；显式 `get_app_state` / `snapshot` 可通过 `text_limit` 正整数或 `"max"` 覆盖，action tools 的刷新结果仍使用 500 字符默认值。对 Electron/WebView 这类深层 UI 会压缩空 `AXGroup` / `AXUnknown` wrapper、过滤 `AXScrollToVisible` 噪音和空字符串属性，避免 action-critical 的输入框被无语义容器挤出节点预算；但通用节点中的 `AXPress` / `AXConfirm` / `AXOpen` 子节点会形成文本摘要边界，避免多个可点击选项被合并成一个 container。这类动作节点如果 frame 有效、尺寸紧凑且不包含带 URL 的 `AXLink` 后代，会保留为带窗口相对 `Frame` 的 `button`，并用短文本后代作为按钮摘要，让 icon-only 和文字 Web 控件都能获得可区分的 `element_index`；包含带 URL 的 `AXLink` 后代时保留通用 wrapper 和链接子节点，避免导航链接被摘要吞掉。对原生 open panel / Finder column view 这类把内容放在 `AXContents` / `AXVisibleChildren` 里的控件，也会把可见文件项纳入元素树。
-- MCP `tools/list` 的 description / input schema 当前按官方 `computer-use` 的 9 个公开 tools 文案和参数面收敛；Windows runtime 额外提供 `save_screenshot` 导出能力，并明确区分模型视觉截图与用户请求的文件导出。
+- MCP `tools/list` 的 description / input schema 当前按官方 `computer-use` 的 9 个公开 tools 文案和参数面收敛；Windows runtime 额外提供 `save_screenshot` 导出能力，并明确区分模型视觉截图与用户请求的文件导出，尽量减少 host 侧提示词和 tool surface 偏差。
 - `open-computer-use call <tool> --args '{...}'` 会直接输出 MCP-style JSON result；`open-computer-use call --calls '[...]'` / `--calls-file <path>` 会在同一进程里顺序执行 JSON 数组里的 tool calls，并复用同一个 `ComputerUseService` 内存态，因此 `get_app_state` 之后的 action tool 可以继续使用同一轮 snapshot 的 `element_index`。Windows 的 `element_index` 是最新 `get_app_state` 返回的 generation-bound opaque identifier；每次成功发布新 snapshot 后旧 identifier 失效，不能把旧的裸数字索引复用到新 snapshot。序列执行默认会在成功的相邻操作之间 sleep 1 秒，也可以用 `--sleep <seconds>` 覆盖；遇到 `isError=true` 的 tool result 后停止。
+- Codex plugin 的 `.mcp.json` 默认不再把这 9 个 tools 直接暴露给模型，而是启动 `scripts/node-repl/open-computer-use-repl.mjs`。adapter 以 child MCP client 连接同一个 native runtime，并只对外列出 `js` / `js_reset`；JavaScript 通过异步 app-bound API（`cua.getApp(...)`、`app.click(...)`、`app.getAXState()` 等）调用 native tools。
+- REPL 使用 Node.js 自带的 evaluator，因此保留 top-level `await` 和跨调用 lexical bindings；真正执行代码的 kernel 位于 Worker 中，超时会终止 Worker 并重建干净 session，避免 `while (true)` 挂死 MCP transport。
+- npm launcher 还直接提供 `ocu js` 和 `ocu repl`：前者为一次性 Worker/native MCP session，后者在当前终端内保留同一个 session 和 binding；两者退出后都会关闭 Worker 与 native MCP child。`ocu capabilities [--json]` 在不启动 native MCP 的情况下报告 Node、adapter、kernel 和当前平台 native artifact 是否齐全。help 始终显示 code-first 命令并标记 availability，不按环境动态隐藏接口。
+- npm bin 当前本身通过 `#!/usr/bin/env node` 启动，因此完全没有 Node 的 shell 无法进入 help/capability 检测；launcher 启动后会复用 `process.execPath`，不会再次从 PATH 解析 Node。若未来要求零 Node 前置，应把最外层入口替换成 native bootstrap 或随包分发 Node。
+- 这是增量迁移：`open-computer-use mcp` 仍是原生 9-tool compatibility surface，已有 CLI、其他 MCP host 和 smoke 不需要切换。
+- JS REPL 的 API 和当前官方 code-first 形态对齐到异步 app binding，而不是把离散 tools 简单包成同步函数。实现不复制或运行 proprietary `@oai/*` package；协议和行为记录在 `docs/references/js-repl.md`。
 - 对真实 app 的 `get_app_state` / action tool 入口，当前只保留一层密码管理器 bundle denylist：bundle-id 直传时直接返回 safety denial；名称匹配时默认不解析到这些 app。终端、Chrome / Atlas 和系统组件不再属于内置阻止目标。
 - 普通 app 的 element frame 当前按“窗口左上角为原点”的 window-relative 坐标输出，便于后续把 `element_index` 和截图坐标统一到同一套参考系。
 - `click` / `set_value` 在执行真实动作前后，会额外驱动一层透明 `SoftwareCursorOverlay` window：两者的移动阶段现在共用一条 heading-driven 的官方风格 motion 内核，显式把“当前 cursor 朝向”和“最终 resting pose”一起喂给选路器，优先生成需要时先掉头、再沿车头方向推进的 C 形/单侧大弧轨迹；首次显示时按官方 binary 的 fresh state 从 AppKit 全局 `(0,0)` window origin 生成起点，后续动作继续复用上一帧 visible tip。真正显示出来的 cursor 不再直接等于 path sample，而是经过一层独立的 visual dynamics 状态，把 visible tip、velocity、angle 和 fog/offset 持续推进。`click` 结尾会衔接 click pulse 和更明显但仍然很小的 rotate wobble，`set_value` 则只做 settle / idle，不给 pulse；两者收尾后会在目标点继续保持 idle 状态，等待下一次动作时 tip 保持 anchored、只保留可感知的小角度摆动；只有连续 30 秒没有新动作时才做 cleanup，这样连续 tool call 不会反复从 fresh `(0,0)` 起步；如果宿主在任务 / turn 结束时发出 `turn-ended`，cursor 会立即消失并清掉本轮位置状态。
@@ -76,7 +82,7 @@
 - overlay 不再依赖临时 `terminal settle` 补丁来修尾；主线现在统一改成“路径层给目标点，visual dynamics 层给可见姿态”的双层模型，所以 move 末段、pulse 和 idle 共用同一套状态，不会再出现 endpoint 锁住后只剩原地翻角的收尾。
 - overlay 的渲染输入也从单一 `rotation` 扩展成 `rotation + cursorBodyOffset + fogOffset + fogScale`，让速度滞后能真正体现在画面上，而不是只存在于主循环内部状态；其中 `rotation` 现在按二进制里 `SoftwareCursorStyle.angle + CursorView._animatedAngleOffsetDegrees` 的分层去近似，不再把“跟随运动方向的主朝向”和“小幅 wiggle offset”压成同一个受限小角度。
 - 动作型 tools 对普通 app 采用“非侵入优先，物理指针路径显式 opt-in”策略：
-  - `perform_secondary_action` 只执行目标元素已经暴露出来的 AX action；无效 action 返回官方风格的 `... is not a valid secondary action for ...`，fixture 的 `Raise` 路径也不再为了测试去准备全局物理指针输入
+  - `perform_secondary_action` 只执行目标元素已经暴露出来的 AX action；Safari 这类 AppKit custom action descriptor（例如 `Name:close tab ...`）会显示为短名称并准确映射回过滤后的原始 AX action，避免 raw/rendered action 错配；短名称与其他显示名称或任一其他原始 AX action（包括被过滤的动作，忽略大小写）冲突时保留完整 descriptor，保证输出 selector 不被原始动作精确匹配抢占；无效或歧义 action 返回官方风格的 `... is not a valid secondary action for ...`，fixture 的 `Raise` 路径也不再为了测试去准备全局物理指针输入
   - `set_value` 会先用 `AXUIElementIsAttributeSettable(kAXValueAttribute)` 判断目标是否真的是可设置值元素，只有 settable 时才调用 `AXUIElementSetAttributeValue`；不可设置时返回官方风格的 non-settable 错误，不退到键盘输入、剪贴板或未公开的文本替换接口
   - `click.click_method` 是开源版的可选扩展，支持 `auto`（默认）、`accessibility`、`app_post`、`sky_click` 和 `global`。未传参数时继续使用原有自动路由；显式模式不会静默 fallback 到其他实现。`accessibility` 只接受 `element_index`；其余 mouse 路径可以使用 `element_index` 的计算落点或原始 `x/y` 坐标。
   - element-targeted `click` 的 `auto` 左键路径会先试原生列表的 `AXSelectedChildren` 选择，再试 `AXPress` / `AXConfirm` / `AXOpen` 这类真正语义化的激活动作；如果目标本身不可点，还会继续尝试其子孙 AX 元素（例如 Finder sidebar row 下面暴露 `AXOpen` 的 cell）和命中点附近的 AX hit-test 结果，最后进入现有 non-AX 分支：未开启全局指针环境变量时使用 `postToPid` 定向鼠标事件，开启时直接使用全局 HID 事件。`AXRaise` / `kAXMainAttribute` / `kAXFocusedAttribute` 这类 activation-only fallback 只允许窗口级元素使用，避免普通静态文本或容器把“获得焦点”误报成“点击已处理”；`click_count > 1` 也会优先重复可用的 AX action。
@@ -86,7 +92,7 @@
   - `CGEvent.postToPid` 定向发送键盘事件，避免为了 `type_text` / `press_key` 抢前台；`type_text` 会把文本按 Unicode extended grapheme cluster 聚合成小批量 `keyboardSetUnicodeString` 事件，避免中文标点、emoji / 代理对和组合字符被逐个 UTF-16 code unit 拆开后在 Electron 富文本输入框里乱序或变形。如果当前 focused element 的 `AXValue` 可设置，`type_text` 会优先按可编辑内容追加并写回 `AXValue`，这覆盖 Feishu / Electron 富文本输入框不可靠接收后台键盘事件的场景，并会过滤已知占位提示，避免把 placeholder 拼进草稿；如果当前 focused element 不是可编辑文本目标，`type_text` 会报错要求先 click 文本输入区或使用 `set_value`，不再把无效果的后台键盘投递当成成功；`press_key` 的 xdotool parser 覆盖官方 binary key table 里常见的 `BackSpace`、`Page_Up`、`Prior` / `Next`、`F1...F12` 和 `KP_*` alias
   - `scroll.pages` 对齐官方 `1.0.755` 的 `number` schema，支持小数页数；整数页且目标暴露 `AXScroll*ByPage` 时优先走 AX action，否则用 `CGEvent.postToPid` 向目标进程定向发送 scroll event
   - `drag` 仍是 coordinate-only API，但默认不再使用全局 `.cghidEventTap` mouse event；默认改为 `CGEvent.postToPid` 定向发送 mouse move / down / dragged / up 事件，避免移动用户真实硬件光标；这些 coordinate tool 的 `x/y` 先按 screenshot pixel 坐标解释，再依据截图像素尺寸与目标 window bounds 的比例映射回 window point / Quartz global 坐标，避免 Retina 窗口上把 2x 像素误当成 1x point 导致点击落到错误位置
-  - `click` / `scroll` / `drag` 在环境变量未开启的默认配置下不会走全局 `.cghidEventTap`，因此不会移动或抢占用户真实鼠标；`OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1` 是全局指针能力的进程级安全门，显式 `click_method=global` 仍必须通过这层授权。默认路径不再为了 fallback 调用 `NSRunningApplication.activate`
+  - `click` / `scroll` / `drag` 在环境变量未开启的默认配置下不会走全局 `.cghidEventTap`，因此不会移动或抢占用户真实鼠标；`OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1` 是全局指针能力的进程级安全门，显式 `click_method=global` 仍必须通过这层授权。默认路径不再为了 fallback 调用 `NSRunningApplication.activate`。`drag` 的结果会在 snapshot 文本之后、截图之前附带一条 `Drag delivered via ...` 文本项，说明本次走的是 `app_post` 定向投递还是全局指针路径；默认路径下同时说明 `postToPid` 事件不经过 window server，因此无法驱动窗口移动、文本拖选、Finder 拖放这类 window server 拖拽会话。`drag` 的 tool description 也同步说明了这一限制和对应环境变量。显式开启全局路径后，拖拽使用默认 event source 向 HID tap 投递，按距离插值并为每步写入位移 delta；macOS 26+ 的 down / dragged / up 还会共享一个手势事件编号，使 window server 能识别窗口移动、文本拖选和 Finder 拖放所需的真实拖拽会话
 
 ### 4. Fixture Bridge
 
@@ -142,6 +148,7 @@
 ## 主要验证路径
 
 - 单元测试：`swift test`
+- JS REPL 与 CLI contract：`node --test scripts/node-repl/*.test.mjs`
 - standalone cursor 构建：`swift build --product StandaloneCursor`
 - cursor lab 构建：`swift build --product CursorMotion`
 - 端到端 smoke：`./scripts/run-tool-smoke-tests.sh`（标准 9-tool smoke + visual cursor idle smoke；脚本默认以 headless 模式启动内部 fixture，避免在用户桌面弹出测试窗口）

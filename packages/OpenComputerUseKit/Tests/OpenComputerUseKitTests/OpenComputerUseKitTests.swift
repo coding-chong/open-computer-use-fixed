@@ -361,6 +361,26 @@ final class OpenComputerUseKitTests: XCTestCase {
         }
     }
 
+    func testAppNameResolutionPrefersRegularAppsAndDisplayNames() {
+        let ranked = [
+            AppDiscovery.ResolutionCandidate(name: "Safari", executableName: nil, isRegularApp: true),
+            AppDiscovery.ResolutionCandidate(name: "Browser", executableName: "Safari", isRegularApp: true),
+            AppDiscovery.ResolutionCandidate(name: "Safari", executableName: nil, isRegularApp: false),
+            AppDiscovery.ResolutionCandidate(name: "Browser Helper", executableName: "Safari", isRegularApp: false),
+        ]
+        for preferred in ranked.indices {
+            for fallback in ranked.indices where fallback > preferred {
+                XCTAssertEqual(AppDiscovery.bestResolutionIndex(of: [ranked[fallback], ranked[preferred]], matching: "sAfArI"), 1)
+                XCTAssertEqual(AppDiscovery.bestResolutionIndex(of: [ranked[preferred], ranked[fallback]], matching: "sAfArI"), 0)
+            }
+        }
+        for candidate in ranked {
+            XCTAssertEqual(AppDiscovery.bestResolutionIndex(of: [candidate, candidate], matching: "Safari"), 0)
+        }
+        XCTAssertNil(AppDiscovery.bestResolutionIndex(of: ranked, matching: "missing"))
+        XCTAssertNil(AppDiscovery.bestResolutionIndex(of: [], matching: "Safari"))
+    }
+
     func testMacOSAppAgentProxyDecisionKeepsNonAutomationCommandsLocal() {
         for command in [
             OpenComputerUseCLICommand.turnEnded(payload: nil),
@@ -584,7 +604,7 @@ final class OpenComputerUseKitTests: XCTestCase {
 
     func testInitializeResponseContainsToolsCapability() throws {
         let server = StdioMCPServer(service: ComputerUseService())
-        let response = server.handle(line: #"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","clientInfo":{"name":"test","version":"0.3.3"},"capabilities":{}}}"#)
+        let response = server.handle(line: #"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","clientInfo":{"name":"test","version":"0.3.5"},"capabilities":{}}}"#)
         XCTAssertNotNil(response)
         XCTAssertTrue(response!.contains(#""name":"open-computer-use""#))
         XCTAssertTrue(response!.contains(#""tools":{"listChanged":false}"#))
@@ -593,7 +613,7 @@ final class OpenComputerUseKitTests: XCTestCase {
     func testInitializeResponseContainsComputerUseInstructions() throws {
         let server = StdioMCPServer(service: ComputerUseService())
         let response = try XCTUnwrap(
-            server.handle(line: #"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","clientInfo":{"name":"test","version":"0.3.3"},"capabilities":{}}}"#)
+            server.handle(line: #"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","clientInfo":{"name":"test","version":"0.3.5"},"capabilities":{}}}"#)
         )
         let data = try XCTUnwrap(response.data(using: .utf8))
         let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
@@ -648,6 +668,10 @@ final class OpenComputerUseKitTests: XCTestCase {
             ((tools["click"]?.inputSchema["properties"] as? [String: [String: Any]])?["click_method"]?["enum"] as? [String]) ?? [],
             ["auto", "accessibility", "app_post", "sky_click", "global"]
         )
+        let dragDescription = tools["drag"]?.description ?? ""
+        XCTAssertTrue(dragDescription.contains("OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1"))
+        XCTAssertTrue(dragDescription.contains("window moves, text selection, or Finder drag-and-drop"))
+        XCTAssertTrue(dragDescription.hasSuffix("This tool is part of plugin `Computer Use`."))
         let getAppStateSchema = tools["get_app_state"]?.inputSchema
         let getAppStateProperties = getAppStateSchema?["properties"] as? [String: [String: Any]]
         XCTAssertNil(getAppStateProperties?["show_full_text"])
@@ -1118,6 +1142,90 @@ final class OpenComputerUseKitTests: XCTestCase {
         ))
     }
 
+    func testAccessibilityRendererUsesSafariCustomActionDescriptionName() {
+        XCTAssertEqual(
+            meaningfulActions(
+                ["Name:close tab Target:SafariTab Selector:_close Button Clicked:"],
+                role: kAXButtonRole as String
+            ),
+            ["close tab"]
+        )
+        XCTAssertNil(accessibilityActionDescriptionName("Namespace:close tab Target:SafariTab"))
+    }
+
+    func testSecondaryActionMatchingKeepsFilteredRawActionsAligned() {
+        let service = ComputerUseService()
+        let closeTab = "Name:close tab Target:SafariTab Selector:_close Button Clicked:"
+        let record = ElementRecord(
+            index: 48,
+            identifier: nil,
+            element: nil,
+            localFrame: nil,
+            role: kAXButtonRole as String,
+            rawActions: [kAXPressAction as String, closeTab],
+            prettyActions: ["close tab"]
+        )
+
+        XCTAssertEqual(service.matchingAction(requested: "close-tab", record: record), closeTab)
+        XCTAssertEqual(service.matchingAction(requested: kAXPressAction as String, record: record), kAXPressAction as String)
+        XCTAssertNil(service.matchingAction(requested: "Press", record: record))
+    }
+
+    func testSecondaryActionSelectorsDoNotShadowRawActionNames() {
+        let service = ComputerUseService()
+        // Include both a filtered action and a visible action, and exercise the
+        // case-insensitive exact lookup used by the executor.
+        for nativeAction in ["AXPress", "AXRaise"] {
+            for customName in [nativeAction, nativeAction.lowercased()] {
+                let customAction = "Name:\(customName) Target:CustomTarget Selector:_custom:"
+                for rawActions in [[nativeAction, customAction], [customAction, nativeAction]] {
+                    let emitted = meaningfulActions(rawActions, role: kAXButtonRole as String)
+                    let visible = meaningfulRawActions(rawActions, role: kAXButtonRole as String)
+                    let record = ElementRecord(
+                        index: 50,
+                        identifier: nil,
+                        element: nil,
+                        localFrame: nil,
+                        role: kAXButtonRole as String,
+                        rawActions: rawActions,
+                        prettyActions: emitted
+                    )
+
+                    XCTAssertTrue(emitted.contains(customAction))
+                    XCTAssertEqual(emitted.count, visible.count)
+                    for (selector, expected) in zip(emitted, visible) {
+                        XCTAssertEqual(service.matchingAction(requested: selector, record: record), expected)
+                    }
+                    XCTAssertEqual(service.matchingAction(requested: nativeAction, record: record), nativeAction)
+                }
+            }
+        }
+    }
+
+    func testSecondaryActionMatchingRejectsAmbiguousDisplayNames() {
+        let service = ComputerUseService()
+        let record = ElementRecord(
+            index: 49,
+            identifier: nil,
+            element: nil,
+            localFrame: nil,
+            role: kAXButtonRole as String,
+            rawActions: [
+                "Name:close tab Target:FirstTab Selector:_close:",
+                "Name:close tab Target:SecondTab Selector:_close:",
+            ],
+            prettyActions: ["close tab", "close tab"]
+        )
+
+        XCTAssertNil(service.matchingAction(requested: "close tab", record: record))
+        XCTAssertEqual(service.matchingAction(requested: record.rawActions[1], record: record), record.rawActions[1])
+        let emitted = meaningfulActions(record.rawActions, role: kAXButtonRole as String)
+        XCTAssertEqual(emitted, record.rawActions)
+        for (selector, rawAction) in zip(emitted, record.rawActions) {
+            XCTAssertEqual(service.matchingAction(requested: selector, record: record), rawAction)
+        }
+    }
+
     func testAccessibilityRendererMarksCompactGenericClickTargetsAsButtons() {
         XCTAssertTrue(shouldRenderCompactGenericActionTarget(
             role: kAXGroupRole as String,
@@ -1365,6 +1473,72 @@ final class OpenComputerUseKitTests: XCTestCase {
         XCTAssertTrue(globalPointerFallbacksEnabled(environment: ["OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS": "yes"]))
         XCTAssertFalse(globalPointerFallbacksEnabled(environment: ["OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS": "0"]))
         XCTAssertFalse(globalPointerFallbacksEnabled(environment: ["OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS": "false"]))
+    }
+
+    func testActionReadBackFlagDefaultsToEnabled() {
+        XCTAssertTrue(actionReadBackEnabled(environment: [:]))
+        XCTAssertTrue(actionReadBackEnabled(environment: ["OPEN_COMPUTER_USE_ACTION_READ_BACK": "1"]))
+        XCTAssertFalse(actionReadBackEnabled(environment: ["OPEN_COMPUTER_USE_ACTION_READ_BACK": "0"]))
+        XCTAssertFalse(actionReadBackEnabled(environment: ["OPEN_COMPUTER_USE_ACTION_READ_BACK": " off "]))
+    }
+
+    func testDragStepCountScalesWithDistanceAndClampsToBounds() {
+        XCTAssertEqual(InputSimulation.dragStepCount(from: .zero, to: .zero), 10)
+        XCTAssertEqual(InputSimulation.dragStepCount(from: CGPoint(x: 0, y: 0), to: CGPoint(x: 8, y: 0)), 10)
+        XCTAssertEqual(InputSimulation.dragStepCount(from: CGPoint(x: 0, y: 0), to: CGPoint(x: 200, y: 0)), 50)
+        XCTAssertEqual(InputSimulation.dragStepCount(from: CGPoint(x: 0, y: 0), to: CGPoint(x: 5000, y: 0)), 60)
+    }
+
+    func testNeedsDragEventNumberGatesOnRecentMacOS() {
+        // Older macOS ignores the gesture event number; 26+ needs it (codex#43047).
+        XCTAssertFalse(InputSimulation.needsDragEventNumber(majorVersion: 14))
+        XCTAssertFalse(InputSimulation.needsDragEventNumber(majorVersion: 15))
+        XCTAssertFalse(InputSimulation.needsDragEventNumber(majorVersion: 25))
+        XCTAssertTrue(InputSimulation.needsDragEventNumber(majorVersion: 26))
+        XCTAssertTrue(InputSimulation.needsDragEventNumber(majorVersion: 27))
+    }
+
+    func testDragDeliveryPathFollowsGlobalPointerGate() {
+        XCTAssertEqual(dragDeliveryPath(environment: [:]), .appPost)
+        XCTAssertEqual(dragDeliveryPath(environment: ["OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS": "0"]), .appPost)
+        XCTAssertEqual(dragDeliveryPath(environment: ["OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS": "1"]), .global)
+        XCTAssertEqual(dragDeliveryPath(environment: ["OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS": " True "]), .global)
+    }
+
+    func testDragDeliveryNoteExplainsWhyDefaultPathCannotDriveWindowServerDrags() {
+        let appPostNote = dragDeliveryNote(for: .appPost)
+        XCTAssertTrue(appPostNote.hasPrefix("Drag delivered via app_post"))
+        XCTAssertTrue(appPostNote.contains("system pointer did not move"))
+        XCTAssertTrue(appPostNote.contains("window moves"))
+        XCTAssertTrue(appPostNote.contains("text selection"))
+        XCTAssertTrue(appPostNote.contains("Finder drag-and-drop"))
+        XCTAssertTrue(appPostNote.contains("OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1"))
+
+        let globalNote = dragDeliveryNote(for: .global)
+        XCTAssertTrue(globalNote.hasPrefix("Drag delivered via global pointer path"))
+        XCTAssertTrue(globalNote.contains("real pointer may have moved"))
+    }
+
+    func testDragDeliveryNoteIsInsertedAfterSnapshotTextAndBeforeScreenshot() {
+        let snapshotText = "App=com.example.app (pid 42)\nWindow: \"Example\", App: Example."
+        let result = ToolCallResult(content: [.text(snapshotText), .pngImage(Data([0x89, 0x50, 0x4E, 0x47]))])
+
+        let annotated = appendingDragDeliveryNote(to: result, path: .appPost)
+
+        XCTAssertEqual(annotated.primaryText, snapshotText)
+        XCTAssertEqual(annotated.content.count, 3)
+        XCTAssertEqual(annotated.content[1].dictionary["type"] as? String, "text")
+        XCTAssertEqual(annotated.content[1].dictionary["text"] as? String, dragDeliveryNote(for: .appPost))
+        XCTAssertEqual(annotated.content[2].dictionary["type"] as? String, "image")
+        XCTAssertFalse(annotated.isError)
+    }
+
+    func testDragDeliveryNoteIsAppendedWhenResultHasNoScreenshot() {
+        let annotated = appendingDragDeliveryNote(to: .text("App=com.example.app (pid 42)"), path: .global)
+
+        XCTAssertEqual(annotated.primaryText, "App=com.example.app (pid 42)")
+        XCTAssertEqual(annotated.content.count, 2)
+        XCTAssertEqual(annotated.content[1].dictionary["text"] as? String, dragDeliveryNote(for: .global))
     }
 
     func testClickMethodDefaultsToAutoAndNormalizesExplicitValues() throws {

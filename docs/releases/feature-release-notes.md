@@ -4,6 +4,15 @@
 
 | 日期 | 功能域 | 用户价值 | 变更摘要 |
 | --- | --- | --- | --- |
+| 2026-09-22 | JS REPL CLI | 用户无需先配置 MCP host，也可以直接用 `ocu js` 执行一次性 Computer Use JavaScript，或用 `ocu repl` 在终端中复用持久 binding；Agent 还能先读取结构化 capability 状态。 | npm launcher 新增 positional/stdin/file 三种 `js` 输入、持久 terminal REPL、`capabilities [--json]` 和稳定 help availability；`ocu mcp` 仍保持原生 9-tool surface。 |
+| 2026-09-22 | JS REPL 错误传播与 read-back | `js` 代码抛出的异常立即以 `isError` 返回且保留 bindings，不再等到 30 s 超时并丢弃 session；macOS 上一批 action 不再为每个动作等待 150 ms 并重新读取整棵 AX tree，十次点击从数秒降到约一次 state read。 | REPL adapter 从 Node 的 `handleError`（Node 26）或 domain（Node 22）路径 settle 当前 evaluation；adapter 以 `OPEN_COMPUTER_USE_ACTION_READ_BACK=0` 启动 native runtime，macOS action 在该模式下返回短状态、跳过 settle 与 snapshot；默认 9-tool 行为不变，Linux / Windows 暂时忽略该变量。 |
+| 2026-09-21 | JS REPL Computer Use | Agent 可以用异步 JavaScript 绑定 app，并在一个 tool round trip 内完成 inspect、action、条件和最终验证，不必在多轮间搬运所有中间状态。 | Codex plugin 通过持久 Node.js Worker 和 app-bound `cua` API 暴露 `js` / `js_reset`；`open-computer-use mcp` 继续保留既有 9-tool compatibility surface。 |
+| 2026-09-17 | DeepSeek Harness 集成 | DSH 用户可以用一条命令安装 Open Computer Use，并在写入配置前发现错误的可执行文件或不兼容的 MCP server。 | 新增 DSH MCP 兼容安装器、turn-boundary 光标清理 hook 和非破坏性 skill 安装；安装前校验 server identity 与非空工具目录但不锁死工具数量，显式安装在 MCP 启动失败时 fail loud，并明确该路径不注册 DSH 的 first-class computer-use provider。 |
+| 2026-09-10 | macOS 拖拽修复 | 显式开启全局指针路径后，窗口移动、文本拖选与 Finder 拖放可收到启动真实拖拽所需的事件；默认路径的限制也会明确呈现。 | 发布 `0.3.5`：补齐拖拽位移、手势事件编号与 HID 投递时序，增加投递路径说明；同步升级 Go MCP SDK 到 `v1.4.1`。 |
+| 2026-09-08 | drag 投递路径可见性 | 在默认安全配置下调用 `drag` 做窗口移动、文本拖选或 Finder 拖放时，结果会明确说明事件只投递给目标进程、为何没有效果，以及需要设置哪个环境变量，不再表现为“成功但无效果”。 | `drag` 结果新增一条 `Drag delivered via app_post` / `Drag delivered via global pointer path` 文本项；tool description 补充默认路径限制与 `OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1` 说明；skill 文档新增 Drag Delivery 章节；默认行为与安全门本身不变。 |
+| 2026-09-08 | macOS 应用定位与 secondary action | 按名称定位应用时减少误选后台 helper，执行 secondary action 时避免动作错配。 | 发布 `0.3.4`：优先匹配普通应用；支持 Safari custom action 短名称，并修复过滤后的动作映射和名称冲突。 |
+| 2026-09-06 | macOS secondary action | Agent 可以通过 Safari 暴露的 `close tab` secondary action 可靠关闭标签页，不会因内部动作被过滤而误执行另一项动作。 | macOS renderer 将 `Name:close tab ...` 形式的 AppKit custom action descriptor 显示为短名称，executor 从同一组过滤后的 raw actions 做等价名称匹配，并拒绝歧义匹配；短名称与其他原始 action 冲突时保留完整 descriptor，避免误执行同名原始动作。 |
+| 2026-09-06 | macOS 应用名称解析 | 按名称定位 Safari 等应用时优先匹配真实应用，避免同名后台 helper 抢占匹配结果。 | 按普通应用名称、普通应用 executable、后台应用名称、后台 executable 分级匹配；同级保持原顺序，bundle identifier 和安全过滤规则不变。 |
 | 2026-09-01 | 内嵌 App Agent Socket 隔离 | 使用内嵌 OCU 的宿主不会再与用户全局 OCU 争用同一个 App Agent Socket，避免一个实例意外终止或替换另一个实例。 | 发布 `0.3.3`，为显式配置 namespace 的宿主生成确定性、短且不泄露原值的 Socket 文件名；未配置时继续兼容旧路径。 |
 
 ## 2026-08

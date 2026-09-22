@@ -27,7 +27,8 @@ It supports the same core tool surface across macOS, Linux, and Windows:
 8. Prefer element-targeted actions using the complete generation-bound opaque `element_index` identifier from the latest Windows `get_app_state` result (macOS/Linux retain their platform-specific snapshot identity behavior).
 9. For multi-step CLI work, use `open-computer-use call --calls '<json-array>'` so one process can reuse the latest element index mapping.
 10. For agent runtimes that support local MCP servers, configure `open-computer-use mcp` or `ocu mcp` and call the exposed Computer Use tools directly. Read [references/usage.md](references/usage.md).
-11. If communication, permission, or desktop-session access fails, read [references/troubleshooting.md](references/troubleshooting.md).
+11. For direct code-first orchestration, run `ocu capabilities` and then use one-shot `ocu js` or persistent `ocu repl`. Read [references/usage.md](references/usage.md).
+12. If communication, permission, or desktop-session access fails, read [references/troubleshooting.md](references/troubleshooting.md).
 
 ## Operating Rules
 
@@ -36,7 +37,7 @@ It supports the same core tool surface across macOS, Linux, and Windows:
 - Do not assume Codex.app plugin helpers are available. Use the installed `open-computer-use` / `ocu` CLI or an explicit MCP config.
 - Always run `get_app_state` before using `element_index`; on Windows copy the complete generation-bound identifier exactly, do not use a bare numeric ordinal, and do not reuse an identifier after an action refresh or UI change.
 - Prefer semantic actions and `set_value` for editable controls. Use coordinate `click`, `scroll`, and `drag` only when the element tree does not expose a safer target.
-- On macOS, do not enable `OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1` unless the user explicitly requested `click_method: "global"` or other diagnostic behavior that may move the real pointer.
+- On macOS, do not enable `OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1` unless the user explicitly requested `click_method: "global"`, a `drag` that must drive a window-server drag session (window move, drag-select text, Finder drag-and-drop), or other diagnostic behavior that may move the real pointer. Without it `drag` reports `Drag delivered via app_post` and those operations have no effect; see `references/usage.md` for alternatives.
 - On Windows and Linux, confirm the command is running inside the logged-in desktop session before assuming GUI automation is available.
 - On Windows, `scroll.pages` supports positive values up to 100; semantic scrolling uses one viewport-percent operation and the fallback uses one app-scoped wheel message. If the call times out, refresh with `get_app_state` before deciding whether to retry because the operation may already have been applied.
 - On Windows, `type_text` writes only to the current focused writable text control after process/window ownership validation. Click or select the field first; it never scans the current UIA tree for a substitute, establishes focus implicitly, or falls back to top-level keyboard messages. Native edit delivery appends using the current UTF-16 value length and verifies the result without replay after a failed postcondition. Use `set_value` with the complete generation-bound identifier in `element_index` when exact element-indexed assignment is required.
@@ -46,6 +47,9 @@ It supports the same core tool surface across macOS, Linux, and Windows:
 ```sh
 open-computer-use -h
 ocu -h
+ocu capabilities --json
+ocu js 'nodeRepl.write(6 * 7)'
+ocu repl
 open-computer-use doctor
 open-computer-use call list_apps
 ocu call list_apps
