@@ -47,7 +47,9 @@ The runtime exposes an asynchronous app-bound API:
 After actions, call \`getAXState()\` in the same js invocation when the next decision depends on the updated UI. Re-derive element indexes from fresh state after navigation or layout changes. Prefer element indexes over coordinates. Open Computer Use keeps its existing local safety gates, including password-manager denial and explicit authorization for global pointer fallbacks.`;
 
 function asError(error) {
-  return error instanceof Error ? error : new Error(String(error));
+  if (error instanceof Error) return error;
+  // Errors thrown inside the REPL context come from another realm and fail instanceof.
+  return new Error(typeof error?.message === "string" ? error.message : String(error));
 }
 
 function isPlainObject(value) {
@@ -333,8 +335,14 @@ export class PersistentJavaScriptSession {
     const input = new PassThrough();
     const output = new PassThrough();
     output.resume();
-    this.repl = repl.start({ prompt: "", input, output, terminal: false, useGlobal: false, ignoreUndefined: true, breakEvalOnSigint: true });
+    // A throw inside evaluated code (sync, or after an await) never reaches the eval
+    // callback: the REPL prints it and moves on. Settle the active evaluation from the
+    // REPL's error path instead. Node 26 exposes `handleError`; Node 22 routes through
+    // a domain.
+    const settle = error => { this.rejectActive?.(error); return "ignore"; };
+    this.repl = repl.start({ prompt: "", input, output, terminal: false, useGlobal: false, ignoreUndefined: true, breakEvalOnSigint: true, handleError: settle });
     this.repl.on("error", () => {});
+    this.repl._domain?.on("error", settle);
     const nodeRepl = {
       cwd: process.cwd(),
       homeDir: process.env.HOME ?? "",
@@ -362,6 +370,7 @@ export class PersistentJavaScriptSession {
     const enforceTimeout = Number.isFinite(timeoutMs) && timeoutMs > 0;
     try {
       const evaluation = new Promise((resolve, reject) => {
+        this.rejectActive = reject;
         this.repl.eval(code, this.repl.context, "open-computer-use-repl", (error, result) => error ? reject(error) : resolve(result));
       });
       const value = enforceTimeout
@@ -377,6 +386,7 @@ export class PersistentJavaScriptSession {
     } finally {
       clearTimeout(timer);
       this.active = null;
+      this.rejectActive = null;
     }
   }
 }
@@ -486,7 +496,9 @@ function resolveNativeCommand(argv) {
 }
 
 export async function runServer({ command, args }) {
-  const native = new JsonLinePeer({ command, args, env: process.env });
+  // Actions return a short status instead of a settle + full snapshot the adapter would
+  // discard; state is read explicitly by getAXState(). Runtimes without the flag ignore it.
+  const native = new JsonLinePeer({ command, args, env: { ...process.env, OPEN_COMPUTER_USE_ACTION_READ_BACK: "0" } });
   await native.initialize();
   const session = new WorkerJavaScriptSession({ native });
   let buffer = "";

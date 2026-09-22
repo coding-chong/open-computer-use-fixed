@@ -66,6 +66,20 @@ Top-level bindings persist across calls. Prefer `var` for reusable names, or use
 `js_reset` when the session really needs a fresh lexical scope. Resetting the
 REPL does not close applications or erase their UI state.
 
+A thrown exception ends the `js` call with `isError: true` and the message;
+bindings survive. Only a timeout resets the session.
+
+## Read-back
+
+The native action tools normally settle for ~150 ms and return a fresh
+snapshot after every action. The adapter discards that result and reads state
+explicitly, so it launches the native runtime with
+`OPEN_COMPUTER_USE_ACTION_READ_BACK=0`: actions return a short status with no
+settle and no snapshot, and one `getAXState()` at the end of a batch reads the
+outcome. On macOS a ten-click batch drops from several seconds to roughly one
+state read. Linux and Windows runtimes ignore the variable for now and keep
+reading back after each action.
+
 ## Entrypoints
 
 - The Codex plugin manifest uses the REPL launcher by default, so its advertised

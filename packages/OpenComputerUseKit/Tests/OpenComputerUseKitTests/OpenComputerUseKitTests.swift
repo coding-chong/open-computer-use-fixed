@@ -1475,6 +1475,13 @@ final class OpenComputerUseKitTests: XCTestCase {
         XCTAssertFalse(globalPointerFallbacksEnabled(environment: ["OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS": "false"]))
     }
 
+    func testActionReadBackFlagDefaultsToEnabled() {
+        XCTAssertTrue(actionReadBackEnabled(environment: [:]))
+        XCTAssertTrue(actionReadBackEnabled(environment: ["OPEN_COMPUTER_USE_ACTION_READ_BACK": "1"]))
+        XCTAssertFalse(actionReadBackEnabled(environment: ["OPEN_COMPUTER_USE_ACTION_READ_BACK": "0"]))
+        XCTAssertFalse(actionReadBackEnabled(environment: ["OPEN_COMPUTER_USE_ACTION_READ_BACK": " off "]))
+    }
+
     func testDragStepCountScalesWithDistanceAndClampsToBounds() {
         XCTAssertEqual(InputSimulation.dragStepCount(from: .zero, to: .zero), 10)
         XCTAssertEqual(InputSimulation.dragStepCount(from: CGPoint(x: 0, y: 0), to: CGPoint(x: 8, y: 0)), 10)

@@ -185,6 +185,20 @@ func globalPointerFallbacksEnabled(environment: [String: String]) -> Bool {
     return ["1", "true", "yes", "on"].contains(rawValue)
 }
 
+/// Whether an action's result reads the window back (settle, then a full snapshot).
+/// A program driving the tools (the `js` REPL adapter) reads state explicitly and
+/// sets `OPEN_COMPUTER_USE_ACTION_READ_BACK=0`, so its actions return a short status.
+func actionReadBackEnabled(environment: [String: String]) -> Bool {
+    guard let rawValue = environment["OPEN_COMPUTER_USE_ACTION_READ_BACK"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+    else {
+        return true
+    }
+
+    return !["0", "false", "no", "off"].contains(rawValue)
+}
+
 /// How a `drag` is delivered. `drag` has no method argument; the path is decided
 /// by the same process-level gate that authorizes `click_method=global`.
 enum DragDeliveryPath: String, CaseIterable {
@@ -448,8 +462,31 @@ func shouldPreferContainingWebRowAXClickCandidate(
 
 public final class ComputerUseService {
     private var snapshotsByApp: [String: AppSnapshot] = [:]
+    // Read per call: the app agent applies the caller's OPEN_COMPUTER_USE_* variables
+    // for the duration of each request.
+    private var actionReadBack: Bool { actionReadBackEnabled(environment: ProcessInfo.processInfo.environment) }
 
     public init() {}
+
+    /// An action's result reads the window back, so the app gets a beat to redraw
+    /// first. Without read-back nothing is read, so there is no wait.
+    private func pauseBeforeReadBack(_ interval: TimeInterval) {
+        guard actionReadBack else {
+            return
+        }
+
+        Thread.sleep(forTimeInterval: interval)
+    }
+
+    /// The result an action returns: the after-action snapshot, or a short status
+    /// when read-back is off.
+    private func actionResult(for query: String, recoveryPolicy: SnapshotRecoveryPolicy = .allowActivation) throws -> ToolCallResult {
+        guard actionReadBack else {
+            return .text("ok")
+        }
+
+        return snapshotResult(for: try refreshSnapshot(for: query, recoveryPolicy: recoveryPolicy), style: .actionResult)
+    }
 
     public func listApps() -> ToolCallResult {
         ToolCallResult.text(
@@ -516,7 +553,7 @@ public final class ComputerUseService {
 
             Thread.sleep(forTimeInterval: 0.15)
             pulseVisualCursor(at: cursorTarget, clickCount: clickCount, mouseButton: button)
-            return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
+            return try actionResult(for: query)
         }
 
         if let elementIndex {
@@ -645,13 +682,7 @@ public final class ComputerUseService {
             throw ComputerUseError.invalidArguments("click requires either element_index or x/y")
         }
 
-        return snapshotResult(
-            for: try refreshSnapshot(
-                for: query,
-                recoveryPolicy: clickActionSnapshotRecoveryPolicy(for: clickMethod)
-            ),
-            style: .actionResult
-        )
+        return try actionResult(for: query, recoveryPolicy: clickActionSnapshotRecoveryPolicy(for: clickMethod))
     }
 
     public func performSecondaryAction(app query: String, elementIndex: String, action: String) throws -> ToolCallResult {
@@ -663,7 +694,7 @@ public final class ComputerUseService {
                 throw ComputerUseError.message(invalidSecondaryActionMessage(action: action, record: record))
             }
 
-            return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
+            return try actionResult(for: query)
         }
 
         guard let rawAction = matchingAction(requested: action, record: record) else {
@@ -679,8 +710,8 @@ public final class ComputerUseService {
             throw ComputerUseError.message("AXUIElementPerformAction failed with \(result.rawValue)")
         }
 
-        Thread.sleep(forTimeInterval: 0.15)
-        return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
+        pauseBeforeReadBack(0.15)
+        return try actionResult(for: query)
     }
 
     public func scroll(app query: String, direction: String, elementIndex: String, pages: Double) throws -> ToolCallResult {
@@ -701,7 +732,7 @@ public final class ComputerUseService {
             }
             try FixtureBridge.post(FixtureCommand(kind: "scroll", identifier: identifier, direction: normalized, pages: pages))
             Thread.sleep(forTimeInterval: 0.15)
-            return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
+            return try actionResult(for: query)
         }
 
         if let repeatCount = integralScrollPageCount(pages),
@@ -723,7 +754,7 @@ public final class ComputerUseService {
             throw ComputerUseError.stateUnavailable("element \(elementIndex) has no scrollable frame")
         }
 
-        return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
+        return try actionResult(for: query)
     }
 
     public func drag(app query: String, fromX: Double, fromY: Double, toX: Double, toY: Double) throws -> ToolCallResult {
@@ -731,7 +762,7 @@ public final class ComputerUseService {
         if snapshot.mode == .fixture {
             try FixtureBridge.post(FixtureCommand(kind: "drag", identifier: "fixture-drag-pad", x: fromX, y: fromY, toX: toX, toY: toY))
             Thread.sleep(forTimeInterval: 0.15)
-            return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
+            return try actionResult(for: query)
         }
 
         let start = try screenshotToGlobalPoint(snapshot: snapshot, x: fromX, y: fromY)
@@ -743,7 +774,7 @@ public final class ComputerUseService {
             snapshot: snapshot
         )
         return appendingDragDeliveryNote(
-            to: snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult),
+            to: try actionResult(for: query),
             path: path
         )
     }
@@ -753,12 +784,12 @@ public final class ComputerUseService {
         if snapshot.mode == .fixture {
             try FixtureBridge.post(FixtureCommand(kind: "type_text", identifier: "fixture-input", value: text))
             Thread.sleep(forTimeInterval: 0.15)
-            return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
+            return try actionResult(for: query)
         }
 
         if try typeTextBySettingFocusedValueIfAvailable(text, in: snapshot) {
-            Thread.sleep(forTimeInterval: 0.1)
-            return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
+            pauseBeforeReadBack(0.1)
+            return try actionResult(for: query)
         }
 
         guard try canTypeTextUsingKeyboardFallback(in: snapshot) else {
@@ -766,7 +797,7 @@ public final class ComputerUseService {
         }
 
         try InputSimulation.typeText(text, pid: snapshot.app.pid)
-        return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
+        return try actionResult(for: query)
     }
 
     public func pressKey(app query: String, key: String) throws -> ToolCallResult {
@@ -774,11 +805,11 @@ public final class ComputerUseService {
         if snapshot.mode == .fixture {
             try FixtureBridge.post(FixtureCommand(kind: "press_key", identifier: "fixture-key-capture", value: key))
             Thread.sleep(forTimeInterval: 0.15)
-            return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
+            return try actionResult(for: query)
         }
 
         try InputSimulation.pressKey(key, pid: snapshot.app.pid)
-        return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
+        return try actionResult(for: query)
     }
 
     public func setValue(app query: String, elementIndex: String, value: String) throws -> ToolCallResult {
@@ -795,7 +826,7 @@ public final class ComputerUseService {
             try FixtureBridge.post(FixtureCommand(kind: "set_value", identifier: identifier, value: value))
             Thread.sleep(forTimeInterval: 0.15)
             settleVisualCursor(at: cursorTarget)
-            return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
+            return try actionResult(for: query)
         }
 
         guard let element = record.element else {
@@ -815,14 +846,14 @@ public final class ComputerUseService {
                 throw ComputerUseError.message("AXUIElementSetAttributeValue failed with \(result.rawValue)")
             }
 
-            Thread.sleep(forTimeInterval: 0.1)
+            pauseBeforeReadBack(0.1)
         } catch {
             settleVisualCursor(at: cursorTarget)
             throw error
         }
 
         settleVisualCursor(at: cursorTarget)
-        return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
+        return try actionResult(for: query)
     }
 
     private func currentSnapshot(for query: String) throws -> AppSnapshot {
@@ -959,7 +990,7 @@ public final class ComputerUseService {
 
         switch result {
         case .success:
-            Thread.sleep(forTimeInterval: 0.15)
+            pauseBeforeReadBack(0.15)
             return true
         case .failure, .attributeUnsupported, .actionUnsupported, .cannotComplete, .noValue, .invalidUIElement, .illegalArgument:
             return false
@@ -1004,21 +1035,21 @@ public final class ComputerUseService {
         if preferContainingWebRowAXClick,
            try performContainingWebRowClick(for: record, snapshot: snapshot, button: button, clickCount: clickCount)
         {
-            Thread.sleep(forTimeInterval: 0.15)
+            pauseBeforeReadBack(0.15)
             return true
         }
 
         if !preferContainingWebRowAXClick {
             if try performPreferredClick(on: record, button: button, clickCount: clickCount) {
                 debugClickDecision("handled by preferred target \(clickDebugDescription(record))")
-                Thread.sleep(forTimeInterval: 0.15)
+                pauseBeforeReadBack(0.15)
                 return true
             }
 
             for candidate in descendantClickCandidates(for: record, snapshot: snapshot) {
                 if try performPreferredClick(on: candidate, button: button, clickCount: clickCount) {
                     debugClickDecision("handled by descendant \(clickDebugDescription(candidate))")
-                    Thread.sleep(forTimeInterval: 0.15)
+                    pauseBeforeReadBack(0.15)
                     return true
                 }
             }
@@ -1033,7 +1064,7 @@ public final class ComputerUseService {
                        try performPreferredClick(on: hitRecord, button: button, clickCount: clickCount)
                     {
                         debugClickDecision("handled by hit record \(clickDebugDescription(hitRecord))")
-                        Thread.sleep(forTimeInterval: 0.15)
+                        pauseBeforeReadBack(0.15)
                         return true
                     }
 
@@ -1048,7 +1079,7 @@ public final class ComputerUseService {
                         ) {
                             if try performPreferredClick(on: candidate, button: button, clickCount: clickCount) {
                                 debugClickDecision("handled by hit descendant \(clickDebugDescription(candidate))")
-                                Thread.sleep(forTimeInterval: 0.15)
+                                pauseBeforeReadBack(0.15)
                                 return true
                             }
                         }
@@ -1069,7 +1100,7 @@ public final class ComputerUseService {
 
         if try activateClickTarget(element: element, availableActions: record.rawActions) {
             debugClickDecision("handled by activation fallback \(clickDebugDescription(record))")
-            Thread.sleep(forTimeInterval: 0.15)
+            pauseBeforeReadBack(0.15)
             return true
         }
 

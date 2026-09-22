@@ -112,6 +112,19 @@ test("tool errors are catchable in JavaScript", async () => {
   assert.equal(result.content.at(-1).text, "caught: typing failed");
 });
 
+test("thrown errors settle the call and keep bindings", async () => {
+  const session = new PersistentJavaScriptSession({ native: mockNative() });
+  await session.run("var kept = 1;");
+  let result = await session.run("nodeRepl.write('before'); null[1];", 1000);
+  assert.equal(result.isError, true);
+  assert.match(result.content.at(-1).text, /^Error: Cannot read properties of null/);
+  result = await session.run("await 1; throw new Error('after await');", 1000);
+  assert.equal(result.isError, true);
+  assert.equal(result.content.at(-1).text, "Error: after await");
+  result = await session.run("nodeRepl.write(kept);");
+  assert.equal(result.content.at(-1).text, "1");
+});
+
 test("screenshots emit binary image content", async () => {
   const session = new PersistentJavaScriptSession({ native: mockNative() });
   const result = await session.run(`
