@@ -17,6 +17,8 @@ while IFS= read -r file; do
   node --check "$file"
 done < <(find "${repo_root}/scripts" -type f -name '*.mjs' | sort)
 
+node --test "${repo_root}/scripts/node-repl/open-computer-use-repl.test.mjs"
+
 (
   cd "${repo_root}/apps/OpenComputerUseLinux"
   python3 -m unittest -v runtime_test.py

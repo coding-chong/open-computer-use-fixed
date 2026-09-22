@@ -41,6 +41,19 @@ press_key
 set_value
 ```
 
+This remains the native compatibility surface. The bundled Codex plugin uses a
+code-first adapter instead and advertises only `js` and `js_reset`. In that
+surface, bind an app and compose actions with asynchronous JavaScript:
+
+```js
+var app = await cua.getApp("TextEdit");
+await app.typeText("Hello");
+await app.getAXState();
+```
+
+Bindings persist across `js` calls until `js_reset`. See
+`docs/references/js-repl.md` for the full API and security boundary.
+
 ## Direct CLI Tool Calls
 
 Use `call` for one-off checks:
