@@ -2,7 +2,10 @@ param(
     [switch]$KeepArtifacts,
     [string]$FixtureHostPath = 'pwsh.exe',
     [string]$RuntimeHostPath = 'powershell.exe',
-    [string]$NativeFixtureHostPath = 'pwsh.exe'
+    [string]$NativeFixtureHostPath = 'pwsh.exe',
+    [switch]$IncludeChromium,
+    [string]$ChromiumBrowserPath = '',
+    [switch]$ChromiumRendererAccessibility
 )
 
 $ErrorActionPreference = 'Stop'
@@ -129,12 +132,15 @@ function Read-State([string]$path) {
     throw 'Fixture state could not be read consistently.'
 }
 
-function Start-Fixture([string]$scriptName, [string]$instance, [int]$left, [int]$top, [string]$hostPath, [bool]$allowOffscreenPlacement = $false) {
+function Start-Fixture([string]$scriptName, [string]$instance, [int]$left, [int]$top, [string]$hostPath, [bool]$allowOffscreenPlacement = $false, [string[]]$extraArguments = @()) {
     $readyPath = Join-Path $runRoot ($instance + '-ready.json')
     $statePath = Join-Path $runRoot ($instance + '-state.json')
     $scriptPath = Join-Path $fixtureRoot $scriptName
     $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $scriptPath, '-InstanceName', $instance, '-ReadyPath', $readyPath, '-StatePath', $statePath, '-Left', [string]$left, '-Top', [string]$top)
     if ($allowOffscreenPlacement) { $arguments += '-AllowOffscreenPlacement' }
+    # Backward-compatible tail: fixtures with extra parameters (the Chromium
+    # fixture's -BrowserPath / -RendererAccessibility) pass them verbatim here.
+    if ($null -ne $extraArguments -and $extraArguments.Count -gt 0) { $arguments += $extraArguments }
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
     $startInfo.FileName = $hostPath
     $startInfo.UseShellExecute = $false
@@ -147,8 +153,8 @@ function Start-Fixture([string]$scriptName, [string]$instance, [int]$left, [int]
     return $target
 }
 
-function Wait-FixtureReady($target) {
-    $deadline = [datetime]::UtcNow.AddSeconds(20)
+function Wait-FixtureReady($target, [int]$timeoutSeconds = 20) {
+    $deadline = [datetime]::UtcNow.AddSeconds($timeoutSeconds)
     while ([datetime]::UtcNow -lt $deadline) {
         if ((Test-Path -LiteralPath $target.ReadyPath) -and (Test-Path -LiteralPath $target.StatePath)) {
             try {
@@ -405,6 +411,117 @@ function Restore-ProcessEnvironment($saved, [string[]]$names) {
         } else {
             Set-Item -Path ('Env:' + $name) -Value $saved[$name]
         }
+    }
+}
+
+function Remove-StaleChromiumFixtureBrowsers {
+    # A Chromium fixture browser is a separate process: killing the fixture host does not
+    # kill it, so a leftover window whose title still carries a fixture instance tag can
+    # answer the next run's title-based snapshot resolution and fail its identity guard.
+    # Fixture-owned browsers are identifiable by the throwaway profile directory that the
+    # fixture passes on the command line, so only those are ever touched.
+    $removed = 0
+    foreach ($browserName in @('chrome', 'msedge')) {
+        foreach ($candidate in @(Get-Process -Name $browserName -ErrorAction SilentlyContinue)) {
+            try {
+                $commandLine = [string](Get-CimInstance Win32_Process -Filter ('ProcessId=' + $candidate.Id) -ErrorAction SilentlyContinue).CommandLine
+                if ([string]::IsNullOrWhiteSpace($commandLine) -or $commandLine -notlike '*ocu-chromium-profile-*') {
+                    continue
+                }
+                [void]$candidate.Kill()
+                $removed += 1
+            } catch {
+            }
+        }
+    }
+    return $removed
+}
+
+function Get-ChromiumBrowserCandidates([string]$explicitPath) {
+    # An explicit override wins outright: a caller-supplied path is never silently
+    # replaced by a discovered browser, so '-ChromiumBrowserPath <bad path>' skips
+    # the section instead of silently testing a browser the caller did not name.
+    $candidates = New-Object System.Collections.Generic.List[string]
+    if (-not [string]::IsNullOrWhiteSpace($explicitPath)) {
+        [void]$candidates.Add($explicitPath)
+        return @($candidates.ToArray())
+    }
+    $roots = @(
+        [Environment]::GetEnvironmentVariable('ProgramFiles'),
+        [Environment]::GetEnvironmentVariable('ProgramFiles(x86)')
+    )
+    foreach ($root in $roots) {
+        if ([string]::IsNullOrWhiteSpace($root)) { continue }
+        [void]$candidates.Add((Join-Path $root 'Google\Chrome\Application\chrome.exe'))
+    }
+    foreach ($root in $roots) {
+        if ([string]::IsNullOrWhiteSpace($root)) { continue }
+        [void]$candidates.Add((Join-Path $root 'Microsoft\Edge\Application\msedge.exe'))
+    }
+    return @($candidates.ToArray())
+}
+
+function Get-InteractiveCursorWitness {
+    # Read-only GetCursorPos sample. It is recorded as evidence for a human
+    # reader only: an operator using the machine moves the cursor during any
+    # run, so the witness never participates in a pass/fail decision.
+    if (-not ('OcuSmokeCursorWitness' -as [type])) {
+        return 'unavailable'
+    }
+    $position = [OcuSmokeCursorWitness]::Position()
+    if ($null -eq $position) {
+        return 'unavailable'
+    }
+    return ([string]$position[0] + ',' + [string]$position[1])
+}
+
+function Write-ChromiumNotice([string]$message) {
+    # Operator-facing progress and skip lines go to the process's stderr handle as
+    # UTF-8 without a BOM: stdout carries the result JSON and must stay
+    # machine-parseable, and the notices must stay readable in a captured log.
+    $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($message + [Environment]::NewLine)
+    $stream = [Console]::OpenStandardError()
+    $stream.Write($bytes, 0, $bytes.Length)
+    $stream.Flush()
+}
+
+function Wait-ChromiumPointSample($target, [int]$clicksBefore, [int]$documentClicksBefore, [string]$description) {
+    # Returns the page-reported point produced by one click, taken from whichever
+    # list the page filled. A click on #click-target also triggers the document
+    # listener, so both counters can rise for one click; the click sample is
+    # preferred because it carries the target id, and a short settle window covers
+    # the case where the document-level sample lands first.
+    $deadline = [datetime]::UtcNow.AddSeconds(10)
+    $settleDeadline = $null
+    while ([datetime]::UtcNow -lt $deadline) {
+        $state = Read-State $target.StatePath
+        if (([int]$state.clicks -gt $clicksBefore) -and (@($state.clickSamples).Count -gt 0)) {
+            $sample = @($state.clickSamples)[-1]
+            return [pscustomobject]@{ kind = 'click'; x = [double]$sample.clientX; y = [double]$sample.clientY; target = [string]$sample.target; state = $state }
+        }
+        if (([int]$state.documentClicks -gt $documentClicksBefore) -and (@($state.documentClickSamples).Count -gt 0)) {
+            if ($null -eq $settleDeadline) { $settleDeadline = [datetime]::UtcNow.AddMilliseconds(400) }
+            if ([datetime]::UtcNow -ge $settleDeadline) {
+                $sample = @($state.documentClickSamples)[-1]
+                return [pscustomobject]@{ kind = 'documentclick'; x = [double]$sample.clientX; y = [double]$sample.clientY; target = [string]$sample.targetId; state = $state }
+            }
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    throw ('Fixture ' + $target.Instance + ' never reported a page point for: ' + $description)
+}
+
+function Get-ChromiumTargetGeometry($state) {
+    # The runtime reads explicit x/y as window-relative screen offsets and adds
+    # windowBounds itself (Get-ScreenPoint), so every point handed to a click is
+    # converted back to a window-relative offset here. The page reports its own
+    # CSS geometry plus devicePixelRatio, so the physical point is derived from
+    # measurements instead of a hard-coded DPI factor.
+    $rect = $state.geometry.clickTarget
+    return [pscustomobject]@{
+        devicePixelRatio = [double]$state.devicePixelRatio
+        centerCssX = ([double]$rect.x + ([double]$rect.width / 2.0))
+        centerCssY = ([double]$rect.y + ([double]$rect.height / 2.0))
     }
 }
 
@@ -1105,6 +1222,433 @@ try {
     $outsideAfter = Read-State $nativeTarget.StatePath
     Assert-Condition ($outsideAfter.clicks -eq $outsideBefore.clicks -and $outsideAfter.buttonDown -eq $outsideBefore.buttonDown -and $outsideAfter.buttonUp -eq $outsideBefore.buttonUp) 'Outside-window app_post changed native counters.'
 
+    # -------------------------------------------------------------------------
+    # Chromium/Electron core-surface section (opt-in: -IncludeChromium).
+    #
+    # A Chromium/Electron content area renders its own UI, so the runtime's
+    # Chromium branches can only be exercised against a real browser rather than
+    # against a WPF or WinForms mock. Test discipline (D1-D5,
+    # research/incident-physical-pointer-hijack.md): this section injects NO
+    # physical pointer or keyboard input on the default path and refuses to start
+    # when the interactive-input authorizations are already present. Physical
+    # pointer/keyboard injection is a supported product capability and is NOT
+    # weakened here: the physical occlusion branch stays implemented and runs
+    # only when the operator opts in with OCU_FIXTURE_ALLOW_PHYSICAL_POINTER=1
+    # while away from the machine.
+    #
+    # Operator-facing notices go to stderr: stdout carries the result JSON and
+    # must stay machine-parseable.
+    # -------------------------------------------------------------------------
+    $chromiumContentAreaOpaque = $false
+    $chromiumTypeTextNewMessage = $false
+    $chromiumSetValueRejected = $false
+    $chromiumAppPostLanded = $false
+    $chromiumGlobalOcclusionFailClosed = $false
+    $chromiumGlobalPhysicalFailClosed = $null
+    $chromiumCoordinateLanding = $false
+    $chromiumCoordinateScale = $null
+    $chromiumCoordinateAnchor = ''
+    $chromiumDevicePixelRatio = $null
+    $chromiumHost = ''
+    $chromiumPointerWitness = ''
+    $chromiumPointerWitnessNote = 'read-only GetCursorPos sample; it is evidence for a human reader, not a pass criterion, because an operator using the machine moves the cursor during any run'
+    $chromiumSkipped = $false
+    $chromiumSkippedReason = ''
+
+    if ($IncludeChromium) {
+        # D2 entry self-check: the default path must carry neither interactive-input
+        # authorization. This constrains this section's entry only; the earlier
+        # missing-frame block authorizes and restores its own two switches around an
+        # injection path that its frame pre-check already rejects.
+        foreach ($chromiumAuthorizationName in @('OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT', 'OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS')) {
+            if (-not [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($chromiumAuthorizationName))) {
+                throw ('The Chromium section refuses to start while ' + $chromiumAuthorizationName + ' is set; unset it so the default path proves that no physical input is injected.')
+            }
+        }
+        Write-ChromiumNotice '[chromium] entry self-check passed: neither interactive-input authorization is present'
+
+        if (-not ('OcuSmokeCursorWitness' -as [type])) {
+            Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class OcuSmokeCursorWitness { [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; } [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT point); public static int[] Position() { POINT point; if (!GetCursorPos(out point)) { return null; } return new int[] { point.X, point.Y }; } } public static class OcuSmokePointOwner { [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; } [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT point); [DllImport("user32.dll")] public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int processId); public static int OwnerPid(int x, int y) { POINT point; point.X = x; point.Y = y; IntPtr hWnd = WindowFromPoint(point); if (hWnd == IntPtr.Zero) { return 0; } int processId; GetWindowThreadProcessId(hWnd, out processId); return processId; } }'
+        }
+        $chromiumWitnessBefore = Get-InteractiveCursorWitness
+
+        $chromiumBrowserResolved = ''
+        foreach ($chromiumCandidate in (Get-ChromiumBrowserCandidates $ChromiumBrowserPath)) {
+            if (Test-Path -LiteralPath $chromiumCandidate -PathType Leaf) {
+                $chromiumBrowserResolved = (Resolve-Path -LiteralPath $chromiumCandidate).Path
+                break
+            }
+        }
+
+        if ([string]::IsNullOrWhiteSpace($chromiumBrowserResolved)) {
+            # No browser: skip, never fail. The runtime is untested here, so every
+            # Chromium result key stays false/empty instead of claiming a pass.
+            $chromiumSkipped = $true
+            if (-not [string]::IsNullOrWhiteSpace($ChromiumBrowserPath)) {
+                $chromiumHost = $ChromiumBrowserPath
+                $chromiumSkippedReason = 'the requested -ChromiumBrowserPath does not exist: ' + $ChromiumBrowserPath
+            } else {
+                $chromiumHost = 'none'
+                $chromiumSkippedReason = 'no Chromium-family browser found under Program Files or Program Files (x86); pass -ChromiumBrowserPath <chrome.exe|msedge.exe>'
+            }
+            Write-ChromiumNotice ('[chromium] SKIPPED: ' + $chromiumSkippedReason)
+        } else {
+            $chromiumHost = $chromiumBrowserResolved
+            Write-ChromiumNotice ('[chromium] host: ' + $chromiumHost)
+
+            $chromiumFixtureArguments = @('-BrowserPath', $chromiumBrowserResolved)
+            if ($ChromiumRendererAccessibility) { $chromiumFixtureArguments += '-RendererAccessibility' }
+            # Placed below the WPF A fixture (20,20) and beside the native fixture
+            # (1120,0) so the three windows stay visually separable; nothing here
+            # depends on z-order. The instance tag is per-run and leftovers are swept
+            # first: a fixed tag would let a stale browser window from an earlier run be
+            # mistaken for this one by the title-based snapshot resolution above.
+            [void](Remove-StaleChromiumFixtureBrowsers)
+            $chromiumTarget = Start-Fixture 'chromium-test-page.ps1' ('Chromium-' + $PID) 40 760 $script:FixtureHostPathResolved $false $chromiumFixtureArguments
+            $chromiumState = Wait-FixtureReady $chromiumTarget 60
+            $chromiumState = Wait-FixtureStateCondition $chromiumTarget {
+                param($state)
+                return ($null -ne $state.geometry) -and ($null -ne $state.geometry.clickTarget) -and ($null -ne $state.devicePixelRatio)
+            } 'Chromium page geometry'
+            $chromiumSnapshot = Get-Snapshot $chromiumState.title
+            Assert-Condition ($null -ne $chromiumSnapshot.app -and $chromiumSnapshot.app.pid -eq $chromiumState.pid -and $chromiumSnapshot.app.mainWindowHandle -eq $chromiumState.hwnd) 'The Chromium snapshot did not retain its fixture identity.'
+            # The fixture's own state bounds and the runtime's windowBounds can legitimately
+            # disagree (measured: fixture 40,760 x 900x680 against runtime 90,1710 x
+            # 2025x1530), so their relationship is recorded as a measurement instead of
+            # asserted. What must hold is that the runtime reported a usable rectangle,
+            # because every point in this section is expressed relative to it.
+            Assert-Condition ([double]$chromiumSnapshot.windowBounds.width -gt 0 -and [double]$chromiumSnapshot.windowBounds.height -gt 0) 'The Chromium snapshot reported no usable window bounds.'
+            $chromiumSpaceShared = ([math]::Abs([double]$chromiumSnapshot.windowBounds.x - [double]$chromiumState.bounds.x) -le 1 -and [math]::Abs([double]$chromiumSnapshot.windowBounds.y - [double]$chromiumState.bounds.y) -le 1 -and [math]::Abs([double]$chromiumSnapshot.windowBounds.width - [double]$chromiumState.bounds.width) -le 1 -and [math]::Abs([double]$chromiumSnapshot.windowBounds.height - [double]$chromiumState.bounds.height) -le 1)
+            Write-ChromiumNotice ('[chromium] fixtureBounds=' + $chromiumState.bounds.x + ',' + $chromiumState.bounds.y + ' ' + $chromiumState.bounds.width + 'x' + $chromiumState.bounds.height + ' runtimeWindowBounds=' + $chromiumSnapshot.windowBounds.x + ',' + $chromiumSnapshot.windowBounds.y + ' ' + $chromiumSnapshot.windowBounds.width + 'x' + $chromiumSnapshot.windowBounds.height + ' sharedSpace=' + $chromiumSpaceShared)
+            $chromiumDevicePixelRatio = [double]$chromiumState.devicePixelRatio
+            Write-ChromiumNotice ('[chromium] elementCount=' + @($chromiumSnapshot.elements).Count + ' devicePixelRatio=' + $chromiumDevicePixelRatio + ' clientOrigin=' + $chromiumState.clientOrigin.x + ',' + $chromiumState.clientOrigin.y + ' bounds=' + $chromiumState.bounds.x + ',' + $chromiumState.bounds.y)
+
+            # Assertion 1 (chromiumContentAreaOpaque): a Chromium content area contributes
+            # NO node that an element-targeted action could reach. Criterion, where any
+            # single clause below is enough to fail:
+            #   1. an element whose name carries one of the page's own control texts
+            #      ('click target' / 'text input'); and
+            #   2. a content-control type (Edit / Document) that carries a frame. The
+            #      omnibox Edit the browser itself exposes has no frame, while the page's
+            #      own <input> arrives framed once the renderer tree is published.
+            # '-ChromiumRendererAccessibility' forces that renderer tree on, which is the
+            # falsification switch: the same criterion must then turn false.
+            $chromiumOpaqueViolations = New-Object System.Collections.Generic.List[string]
+            foreach ($chromiumElement in @($chromiumSnapshot.elements)) {
+                $chromiumElementName = [string]$chromiumElement.name
+                $chromiumElementControlType = [string]$chromiumElement.controlType
+                if ($chromiumElementName -match '(?i)click target|text input') {
+                    [void]$chromiumOpaqueViolations.Add('page-control-text:' + $chromiumElementControlType + ':' + $chromiumElementName)
+                }
+                $chromiumElementHasFrame = ($null -ne $chromiumElement.frame -and [double]$chromiumElement.frame.width -gt 0 -and [double]$chromiumElement.frame.height -gt 0)
+                if ($chromiumElementHasFrame -and ($chromiumElementControlType -eq 'ControlType.Edit' -or $chromiumElementControlType -eq 'ControlType.Document')) {
+                    [void]$chromiumOpaqueViolations.Add('framed-content-control:' + $chromiumElementControlType)
+                }
+            }
+            $chromiumContentAreaOpaque = ($chromiumOpaqueViolations.Count -eq 0)
+            # A control-type census is emitted so a criterion that is too weak is
+            # diagnosable from the log alone, including on the falsification run
+            # (-ChromiumRendererAccessibility), where the renderer tree appears.
+            $chromiumControlTypeCensus = @($chromiumSnapshot.elements | Group-Object controlType | Sort-Object Name | ForEach-Object { $_.Name + ':' + $_.Count }) -join ','
+            Write-ChromiumNotice ('[chromium] contentAreaOpaque=' + $chromiumContentAreaOpaque + ' violations=' + $chromiumOpaqueViolations.Count + ' controlTypes=' + $chromiumControlTypeCensus)
+            Assert-Condition $chromiumContentAreaOpaque ('The Chromium content area contributed addressable nodes: ' + ($chromiumOpaqueViolations -join '; '))
+
+            # Assertion 2 (chromiumTypeTextNewMessage): no writable text control owned by
+            # the browser process is focused, so type_text must return the exact bounded
+            # message. Test-TypeTextTargetResponse holds the one literal this repository
+            # compares against, so matching through it is byte-for-byte.
+            $chromiumTypeTextResponse = Invoke-Runtime ([pscustomobject]@{
+                tool = 'type_text'; app = $chromiumState.title; text = 'must-not-type'
+                expectedPid = [int]$chromiumSnapshot.app.pid
+                expectedProcessStartTimeTicks = [int64]$chromiumSnapshot.app.processStartTimeTicks
+                expectedMainWindowHandle = [int64]$chromiumSnapshot.app.mainWindowHandle
+            })
+            $chromiumTypeTextNewMessage = Test-TypeTextTargetResponse $chromiumTypeTextResponse
+            Write-ChromiumNotice ('[chromium] type_text errorBytes=' + [System.Text.Encoding]::UTF8.GetByteCount([string]$chromiumTypeTextResponse.error) + ' exactMatch=' + $chromiumTypeTextNewMessage)
+            Assert-Condition $chromiumTypeTextNewMessage ('type_text on the Chromium content area did not return the bounded message: ' + $chromiumTypeTextResponse.error)
+
+            # Assertion 3 (chromiumSetValueRejected): set_value must refuse a real
+            # non-settable window element with no side effect on the page, and a bare
+            # legacy element index must still be rejected as an expired target.
+            $chromiumSetValueWindowElement = @($chromiumSnapshot.elements)[0]
+            Assert-Condition ($null -ne $chromiumSetValueWindowElement -and -not ($chromiumSetValueWindowElement.actions -contains 'SetValue')) 'The first Chromium element was not a non-settable window element.'
+            $chromiumSetValueBaseline = Read-State $chromiumTarget.StatePath
+            $chromiumNotSettableResponse = Invoke-Runtime ([pscustomobject]@{
+                tool = 'set_value'; app = $chromiumState.title; element = $chromiumSetValueWindowElement; value = 'must-not-write'
+                windowBounds = $chromiumSnapshot.windowBounds
+                expectedPid = [int]$chromiumSnapshot.app.pid
+                expectedProcessStartTimeTicks = [int64]$chromiumSnapshot.app.processStartTimeTicks
+                expectedMainWindowHandle = [int64]$chromiumSnapshot.app.mainWindowHandle
+            })
+            $chromiumLegacyIndexResponse = Invoke-Runtime ([pscustomobject]@{
+                tool = 'set_value'; app = $chromiumState.title; element_index = 0; value = 'must-not-write'
+                windowBounds = $chromiumSnapshot.windowBounds
+                expectedPid = [int]$chromiumSnapshot.app.pid
+                expectedProcessStartTimeTicks = [int64]$chromiumSnapshot.app.processStartTimeTicks
+                expectedMainWindowHandle = [int64]$chromiumSnapshot.app.mainWindowHandle
+            })
+            Start-Sleep -Milliseconds 500
+            $chromiumSetValueAfter = Read-State $chromiumTarget.StatePath
+            $chromiumSetValueRejected = (
+                (-not $chromiumNotSettableResponse.ok) -and
+                $chromiumNotSettableResponse.error -eq 'Cannot set a value for an element that is not settable' -and
+                (Test-TargetChangedResponse $chromiumLegacyIndexResponse) -and
+                [int]$chromiumSetValueAfter.inputEvents -eq [int]$chromiumSetValueBaseline.inputEvents
+            )
+            Write-ChromiumNotice ('[chromium] setValue element="' + $chromiumNotSettableResponse.error + '" legacyIndex="' + $chromiumLegacyIndexResponse.error + '" inputEvents=' + $chromiumSetValueBaseline.inputEvents + '->' + $chromiumSetValueAfter.inputEvents)
+            Assert-Condition $chromiumSetValueRejected 'set_value against the Chromium content area was not rejected without side effects.'
+
+            # --- Coordinate space (measured, not assumed) -------------------------
+            # The fixture process and the runtime need not report the same coordinate
+            # space, and which space the runtime reports can differ between runs
+            # (measured: one run where the fixture state said bounds 40,760 x 900x680
+            # while the runtime snapshot said 90,1710 x 2025x1530). Mixing the two
+            # spaces pushed the effective click point off the physical screen and the
+            # runtime rejected it as "Target changed". Every point below is therefore
+            # built ONLY from $chromiumSnapshot.windowBounds, because that is the value
+            # the runtime itself adds to explicit x/y (Get-ScreenPoint) before it
+            # delivers input. The fixture state contributes only page-reported
+            # quantities (CSS rectangles, devicePixelRatio, counters), never an origin.
+            $chromiumGeometry = Get-ChromiumTargetGeometry $chromiumState
+            $chromiumCentreRelX = [double]$chromiumSnapshot.windowBounds.width / 3.0
+            $chromiumCentreRelY = [double]$chromiumSnapshot.windowBounds.height / 3.0
+
+            # Calibration probe A: send the window centre, which is inside the content
+            # area, and read back where the page says the click landed. The answer is
+            # usable whether the click hit the target (a click sample) or only the page
+            # (a document-click sample): both report clientX/clientY. The anchor is the
+            # page's client-space origin in runtime units relative to windowBounds:
+            # anchor = rel - reported x dpr.
+            $chromiumProbeBaseline = Read-State $chromiumTarget.StatePath
+            $chromiumProbeResponse = Invoke-Runtime ([pscustomobject]@{
+                tool = 'click'; app = $chromiumState.title; x = $chromiumCentreRelX; y = $chromiumCentreRelY
+                click_count = 1; mouse_button = 'left'; click_method = 'app_post'
+                windowBounds = $chromiumSnapshot.windowBounds
+                expectedPid = [int]$chromiumSnapshot.app.pid
+                expectedProcessStartTimeTicks = [int64]$chromiumSnapshot.app.processStartTimeTicks
+                expectedMainWindowHandle = [int64]$chromiumSnapshot.app.mainWindowHandle
+            })
+            Assert-Condition $chromiumProbeResponse.ok ('Chromium coordinate calibration probe failed: ' + $chromiumProbeResponse.error)
+            $chromiumProbeSample = Wait-ChromiumPointSample $chromiumTarget ([int]$chromiumProbeBaseline.clicks) ([int]$chromiumProbeBaseline.documentClicks) 'Chromium coordinate calibration probe'
+            $chromiumAnchorX = $chromiumCentreRelX - ($chromiumProbeSample.x * $chromiumGeometry.devicePixelRatio)
+            $chromiumAnchorY = $chromiumCentreRelY - ($chromiumProbeSample.y * $chromiumGeometry.devicePixelRatio)
+            $chromiumCoordinateAnchor = [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, '{0:F2},{1:F2}', $chromiumAnchorX, $chromiumAnchorY) + ' runtime-units-relative-to-snapshot.windowBounds'
+
+            # Calibration probe B turns the assumed devicePixelRatio into a measurement:
+            # the same origin plus a known runtime-unit offset must move the page's
+            # reported point by that offset divided by the scale. A scale near
+            # devicePixelRatio means one runtime unit is one physical pixel; a scale near
+            # 1 would mean the runtime is already reporting CSS-scaled units, which this
+            # assertion makes visible instead of silently mis-landing.
+            $chromiumScaleOffset = 120.0
+            $chromiumScaleBaseline = Read-State $chromiumTarget.StatePath
+            $chromiumScaleResponse = Invoke-Runtime ([pscustomobject]@{
+                tool = 'click'; app = $chromiumState.title; x = ($chromiumCentreRelX + $chromiumScaleOffset); y = ($chromiumCentreRelY + $chromiumScaleOffset)
+                click_count = 1; mouse_button = 'left'; click_method = 'app_post'
+                windowBounds = $chromiumSnapshot.windowBounds
+                expectedPid = [int]$chromiumSnapshot.app.pid
+                expectedProcessStartTimeTicks = [int64]$chromiumSnapshot.app.processStartTimeTicks
+                expectedMainWindowHandle = [int64]$chromiumSnapshot.app.mainWindowHandle
+            })
+            Assert-Condition $chromiumScaleResponse.ok ('Chromium coordinate scale probe failed: ' + $chromiumScaleResponse.error)
+            $chromiumScaleSample = Wait-ChromiumPointSample $chromiumTarget ([int]$chromiumScaleBaseline.clicks) ([int]$chromiumScaleBaseline.documentClicks) 'Chromium coordinate scale probe'
+            $chromiumScaleX = $chromiumScaleOffset / ($chromiumScaleSample.x - $chromiumProbeSample.x)
+            $chromiumScaleY = $chromiumScaleOffset / ($chromiumScaleSample.y - $chromiumProbeSample.y)
+            $chromiumCoordinateScale = ($chromiumScaleX + $chromiumScaleY) / 2.0
+            $chromiumCoordinateScaleMatched = ([math]::Abs($chromiumCoordinateScale - $chromiumGeometry.devicePixelRatio) -le 0.1)
+            Write-ChromiumNotice ('[chromium] probe=' + $chromiumProbeSample.kind + ':' + $chromiumProbeSample.x + ',' + $chromiumProbeSample.y + ' scaled=' + $chromiumScaleSample.kind + ':' + $chromiumScaleSample.x + ',' + $chromiumScaleSample.y + ' anchor=' + $chromiumCoordinateAnchor + ' scale=' + [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, '{0:F4}', $chromiumCoordinateScale) + ' dpr=' + $chromiumGeometry.devicePixelRatio)
+            Assert-Condition $chromiumCoordinateScaleMatched ('The measured coordinate scale did not match the page devicePixelRatio: scale=' + $chromiumCoordinateScale + ' dpr=' + $chromiumGeometry.devicePixelRatio)
+
+            # Landing point: the page's target centre mapped back through the anchor.
+            $chromiumTargetRelX = $chromiumAnchorX + ($chromiumGeometry.centerCssX * $chromiumGeometry.devicePixelRatio)
+            $chromiumTargetRelY = $chromiumAnchorY + ($chromiumGeometry.centerCssY * $chromiumGeometry.devicePixelRatio)
+
+            # Assertion 4 (chromiumAppPostLanded): with explicit coordinates,
+            # click_method 'app_post' must land on the page target through the
+            # window-message path (no pointer motion), and 'auto' must reproduce it.
+            # The WPF-only app_post capability error must NOT be expected here: Chromium
+            # is a native HWND target, so a landed click is the observable result.
+            $chromiumAppPostBaseline = Read-State $chromiumTarget.StatePath
+            $chromiumAppPostResponse = Invoke-Runtime ([pscustomobject]@{
+                tool = 'click'; app = $chromiumState.title; x = $chromiumTargetRelX; y = $chromiumTargetRelY
+                click_count = 1; mouse_button = 'left'; click_method = 'app_post'
+                windowBounds = $chromiumSnapshot.windowBounds
+                expectedPid = [int]$chromiumSnapshot.app.pid
+                expectedProcessStartTimeTicks = [int64]$chromiumSnapshot.app.processStartTimeTicks
+                expectedMainWindowHandle = [int64]$chromiumSnapshot.app.mainWindowHandle
+            })
+            Assert-Condition $chromiumAppPostResponse.ok ('Chromium app_post click failed: ' + $chromiumAppPostResponse.error)
+            $chromiumAppPostSample = Wait-ChromiumPointSample $chromiumTarget ([int]$chromiumAppPostBaseline.clicks) ([int]$chromiumAppPostBaseline.documentClicks) 'Chromium app_post landing'
+            $chromiumAppPostLanded = (
+                $chromiumAppPostResponse.ok -and
+                [int]$chromiumAppPostSample.state.clicks -eq ([int]$chromiumAppPostBaseline.clicks + 1) -and
+                $chromiumAppPostSample.kind -eq 'click' -and
+                $chromiumAppPostSample.target -eq '#click-target'
+            )
+            Write-ChromiumNotice ('[chromium] appPost clicks=' + $chromiumAppPostBaseline.clicks + '->' + $chromiumAppPostSample.state.clicks + ' kind=' + $chromiumAppPostSample.kind + ' target=' + $chromiumAppPostSample.target + ' reported=' + $chromiumAppPostSample.x + ',' + $chromiumAppPostSample.y)
+            Assert-Condition $chromiumAppPostLanded ('Chromium app_post did not land on the page target: kind=' + $chromiumAppPostSample.kind + ' target=' + $chromiumAppPostSample.target + ' reported=' + $chromiumAppPostSample.x + ',' + $chromiumAppPostSample.y)
+
+            $chromiumAutoBaseline = $chromiumAppPostSample.state
+            $chromiumAutoResponse = Invoke-Runtime ([pscustomobject]@{
+                tool = 'click'; app = $chromiumState.title; x = $chromiumTargetRelX; y = $chromiumTargetRelY
+                click_count = 1; mouse_button = 'left'; click_method = 'auto'
+                windowBounds = $chromiumSnapshot.windowBounds
+                expectedPid = [int]$chromiumSnapshot.app.pid
+                expectedProcessStartTimeTicks = [int64]$chromiumSnapshot.app.processStartTimeTicks
+                expectedMainWindowHandle = [int64]$chromiumSnapshot.app.mainWindowHandle
+            })
+            Assert-Condition $chromiumAutoResponse.ok ('Chromium auto click failed: ' + $chromiumAutoResponse.error)
+            $chromiumAutoSample = Wait-ChromiumPointSample $chromiumTarget ([int]$chromiumAutoBaseline.clicks) ([int]$chromiumAutoBaseline.documentClicks) 'Chromium auto landing'
+            # Both non-physical methods must land; the single key reports the pair.
+            $chromiumAppPostLanded = (
+                $chromiumAppPostLanded -and
+                $chromiumAutoResponse.ok -and
+                [int]$chromiumAutoSample.state.clicks -eq ([int]$chromiumAutoBaseline.clicks + 1) -and
+                $chromiumAutoSample.kind -eq 'click' -and
+                $chromiumAutoSample.target -eq '#click-target'
+            )
+            Write-ChromiumNotice ('[chromium] auto clicks=' + $chromiumAutoBaseline.clicks + '->' + $chromiumAutoSample.state.clicks + ' kind=' + $chromiumAutoSample.kind + ' target=' + $chromiumAutoSample.target + ' reported=' + $chromiumAutoSample.x + ',' + $chromiumAutoSample.y)
+            Assert-Condition $chromiumAppPostLanded ('Chromium auto did not land on the page target: kind=' + $chromiumAutoSample.kind + ' target=' + $chromiumAutoSample.target + ' reported=' + $chromiumAutoSample.x + ',' + $chromiumAutoSample.y)
+
+            # Assertion 6 (chromiumCoordinateLanding): the anchored point must land on
+            # the target, and the page's reported point must match the target centre the
+            # page reports for that click, within a tightened tolerance. The reported
+            # client point is an integer, so the aim is compared against the rectangle
+            # the page reports at that moment, not against the one probed earlier.
+            $chromiumLandingBaseline = $chromiumAutoSample.state
+            $chromiumLandingResponse = Invoke-Runtime ([pscustomobject]@{
+                tool = 'click'; app = $chromiumState.title; x = $chromiumTargetRelX; y = $chromiumTargetRelY
+                click_count = 1; mouse_button = 'left'; click_method = 'app_post'
+                windowBounds = $chromiumSnapshot.windowBounds
+                expectedPid = [int]$chromiumSnapshot.app.pid
+                expectedProcessStartTimeTicks = [int64]$chromiumSnapshot.app.processStartTimeTicks
+                expectedMainWindowHandle = [int64]$chromiumSnapshot.app.mainWindowHandle
+            })
+            Assert-Condition $chromiumLandingResponse.ok ('Chromium calibrated coordinate click failed: ' + $chromiumLandingResponse.error)
+            $chromiumLandingSample = Wait-ChromiumPointSample $chromiumTarget ([int]$chromiumLandingBaseline.clicks) ([int]$chromiumLandingBaseline.documentClicks) 'Chromium calibrated coordinate landing'
+            $chromiumLandingRect = $chromiumLandingSample.state.geometry.clickTarget
+            $chromiumLandingCentreCssX = [double]$chromiumLandingRect.x + ([double]$chromiumLandingRect.width / 2.0)
+            $chromiumLandingCentreCssY = [double]$chromiumLandingRect.y + ([double]$chromiumLandingRect.height / 2.0)
+            # Four CSS pixels: the reported point is an integer, the sent point is rounded
+            # to whole runtime units, and the anchor comes from one integer sample, so a
+            # couple of CSS pixels of residual error are expected. A wrong scale or a
+            # wrong anchor misses by far more than this.
+            $chromiumCoordinateTolerance = 4.0
+            $chromiumCoordinateLanding = (
+                $chromiumLandingResponse.ok -and
+                $chromiumLandingSample.kind -eq 'click' -and
+                $chromiumLandingSample.target -eq '#click-target' -and
+                [math]::Abs($chromiumLandingSample.x - $chromiumLandingCentreCssX) -le $chromiumCoordinateTolerance -and
+                [math]::Abs($chromiumLandingSample.y - $chromiumLandingCentreCssY) -le $chromiumCoordinateTolerance
+            )
+            Write-ChromiumNotice ('[chromium] calibrated rel=' + [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, '{0:F2},{1:F2}', $chromiumTargetRelX, $chromiumTargetRelY) + ' reported=' + $chromiumLandingSample.x + ',' + $chromiumLandingSample.y + ' centre=' + [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, '{0:F2},{1:F2}', $chromiumLandingCentreCssX, $chromiumLandingCentreCssY) + ' inCentre=' + $chromiumCoordinateLanding)
+            Assert-Condition $chromiumCoordinateLanding ('The calibrated Chromium click did not land on the reported target centre: kind=' + $chromiumLandingSample.kind + ' reported=' + $chromiumLandingSample.x + ',' + $chromiumLandingSample.y + ' centre=' + $chromiumLandingCentreCssX + ',' + $chromiumLandingCentreCssY)
+
+            # Assertion 5a (chromiumGlobalOcclusionFailClosed): unauthorized global
+            # pointer input must be refused before any injection, and the page must
+            # not observe a click. No occlusion window is built here: with the
+            # authorization absent the refusal happens before any occlusion
+            # evaluation, so occlusion cannot change the outcome. Occlusion semantics
+            # belong to the opt-in physical branch in 5b.
+            $chromiumClicksBeforeGlobal = [int](Read-State $chromiumTarget.StatePath).clicks
+            $chromiumUnauthorizedGlobalResponse = Invoke-Runtime ([pscustomobject]@{
+                tool = 'click'; app = $chromiumState.title; x = $chromiumTargetRelX; y = $chromiumTargetRelY
+                click_count = 1; mouse_button = 'left'; click_method = 'global'
+                windowBounds = $chromiumSnapshot.windowBounds
+                expectedPid = [int]$chromiumSnapshot.app.pid
+                expectedProcessStartTimeTicks = [int64]$chromiumSnapshot.app.processStartTimeTicks
+                expectedMainWindowHandle = [int64]$chromiumSnapshot.app.mainWindowHandle
+            })
+            Start-Sleep -Milliseconds 400
+            $chromiumAfterGlobal = Read-State $chromiumTarget.StatePath
+            $chromiumGlobalOcclusionFailClosed = (
+                (-not $chromiumUnauthorizedGlobalResponse.ok) -and
+                [string]$chromiumUnauthorizedGlobalResponse.error -like '*Interactive Windows input is disabled by default*' -and
+                [int]$chromiumAfterGlobal.clicks -eq $chromiumClicksBeforeGlobal
+            )
+            Write-ChromiumNotice ('[chromium] global error="' + $chromiumUnauthorizedGlobalResponse.error + '" clicks=' + $chromiumClicksBeforeGlobal + '->' + $chromiumAfterGlobal.clicks)
+            Assert-Condition $chromiumGlobalOcclusionFailClosed 'Unauthorized global click on the Chromium target was not refused without side effects.'
+
+            # Assertion 5b (chromiumGlobalPhysicalFailClosed): physical pointer branch.
+            # IMPLEMENTED, NOT RUN BY DEFAULT. Only the operator may enable it, and only
+            # while away from the machine: this branch really moves the system pointer
+            # and can take foreground focus, because that is what the product's
+            # physical-input path does. It covers the target point with an unrelated
+            # window and proves the physical path fails closed on occlusion without
+            # moving the pointer.
+            if ([Environment]::GetEnvironmentVariable('OCU_FIXTURE_ALLOW_PHYSICAL_POINTER') -eq '1') {
+                # The point to cover is expressed in the runtime's space, like every
+                # other point in this section, and the cover is placed from the same
+                # value. The read-only owner check below then decides whether the cover
+                # really owns that point: if the fixture host and the runtime disagree
+                # about the coordinate space, the cover lands elsewhere, the check fails
+                # and the branch refuses to inject rather than clicking into whatever is
+                # actually there.
+                $chromiumPhysicalPointX = [double]$chromiumSnapshot.windowBounds.x + $chromiumTargetRelX
+                $chromiumPhysicalPointY = [double]$chromiumSnapshot.windowBounds.y + $chromiumTargetRelY
+                $chromiumCoverLeft = [int][math]::Round($chromiumPhysicalPointX - 120)
+                $chromiumCoverTop = [int][math]::Round($chromiumPhysicalPointY - 120)
+                $chromiumCoverTarget = Start-Fixture 'wpf-test-bench.ps1' 'ChromiumCover' $chromiumCoverLeft $chromiumCoverTop $script:FixtureHostPathResolved
+                $chromiumCoverState = Wait-FixtureReady $chromiumCoverTarget
+                # Cover the exact target point and raise the cover above the browser.
+                # SWP_NOZORDER must be absent here or HWND_TOPMOST would be ignored and
+                # the "occluded" click would land on the browser instead of failing
+                # closed. SWP_NOACTIVATE keeps the cover from taking foreground.
+                [void][OcuSmokeWindow]::SetWindowPos([IntPtr]$chromiumCoverState.hwnd, [IntPtr](-1), $chromiumCoverLeft, $chromiumCoverTop, 900, 680, 0x0001 -bor 0x0002 -bor 0x0010 -bor 0x0040)
+                Start-Sleep -Milliseconds 300
+                # Read-only proof that the cover owns the point. Without it the branch
+                # could inject a real click into whatever window happens to be there,
+                # which is exactly the accident this opt-in exists to prevent.
+                $chromiumCoverOwner = [OcuSmokePointOwner]::OwnerPid([int][math]::Round($chromiumPhysicalPointX), [int][math]::Round($chromiumPhysicalPointY))
+                Assert-Condition ($chromiumCoverOwner -eq [int]$chromiumCoverState.pid) ('The cover window does not own the target point (owner pid ' + $chromiumCoverOwner + '), so the physical branch refuses to inject.')
+                $chromiumPhysicalPointerBefore = Get-InteractiveCursorWitness
+                $chromiumPhysicalClicksBefore = [int](Read-State $chromiumTarget.StatePath).clicks
+                $chromiumPhysicalEnvironmentNames = @('OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT', 'OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS')
+                $chromiumSavedPhysicalEnvironment = @{}
+                foreach ($chromiumEnvironmentName in $chromiumPhysicalEnvironmentNames) {
+                    $chromiumSavedPhysicalEnvironment[$chromiumEnvironmentName] = [Environment]::GetEnvironmentVariable($chromiumEnvironmentName)
+                    Set-Item -Path ('Env:' + $chromiumEnvironmentName) -Value '1'
+                }
+                try {
+                    $chromiumPhysicalResponse = Invoke-Runtime ([pscustomobject]@{
+                        tool = 'click'; app = $chromiumState.title; x = $chromiumTargetRelX; y = $chromiumTargetRelY
+                        click_count = 1; mouse_button = 'left'; click_method = 'global'
+                        windowBounds = $chromiumSnapshot.windowBounds
+                        expectedPid = [int]$chromiumSnapshot.app.pid
+                        expectedProcessStartTimeTicks = [int64]$chromiumSnapshot.app.processStartTimeTicks
+                        expectedMainWindowHandle = [int64]$chromiumSnapshot.app.mainWindowHandle
+                    })
+                    Start-Sleep -Milliseconds 400
+                    $chromiumPhysicalAfter = Read-State $chromiumTarget.StatePath
+                    $chromiumPhysicalPointerAfter = Get-InteractiveCursorWitness
+                    $chromiumGlobalPhysicalFailClosed = (
+                        (-not $chromiumPhysicalResponse.ok) -and
+                        [string]$chromiumPhysicalResponse.error -like '*is not the topmost descendant of the snapshot window at the requested pointer coordinates*' -and
+                        [int]$chromiumPhysicalAfter.clicks -eq $chromiumPhysicalClicksBefore -and
+                        $chromiumPhysicalPointerAfter -eq $chromiumPhysicalPointerBefore
+                    )
+                    Write-ChromiumNotice ('[chromium] physical global error="' + $chromiumPhysicalResponse.error + '" clicks=' + $chromiumPhysicalClicksBefore + '->' + $chromiumPhysicalAfter.clicks + ' pointer=' + $chromiumPhysicalPointerBefore + '->' + $chromiumPhysicalPointerAfter)
+                    Assert-Condition $chromiumGlobalPhysicalFailClosed 'The occluded physical click did not fail closed without moving the pointer.'
+                } finally {
+                    Restore-ProcessEnvironment $chromiumSavedPhysicalEnvironment $chromiumPhysicalEnvironmentNames
+                    if ($null -ne $chromiumCoverTarget.Process -and -not $chromiumCoverTarget.Process.HasExited) {
+                        try {
+                            [void]$chromiumCoverTarget.Process.Kill()
+                            [void]$chromiumCoverTarget.Process.WaitForExit(5000)
+                        } catch {
+                        }
+                    }
+                }
+            } else {
+                Write-ChromiumNotice '[chromium] 5b SKIPPED: 此段会真实移动你的鼠标（物理遮挡 fail-closed 用例）。请在离开电脑时设置 OCU_FIXTURE_ALLOW_PHYSICAL_POINTER=1 再运行。'
+                $chromiumGlobalPhysicalFailClosed = $null
+            }
+        }
+
+        $chromiumPointerWitness = $chromiumWitnessBefore + '->' + (Get-InteractiveCursorWitness)
+        Write-ChromiumNotice ('[chromium] cursor witness (read-only, not a pass criterion): ' + $chromiumPointerWitness)
+    }
+
     $originalIdentityRuntimeId = Get-RuntimeIdKey $identityElementA
     $replacementRuntimeIdA = Get-RuntimeIdKey $replacement.records[0]
     $replacementRuntimeIdB = Get-RuntimeIdKey $replacement.records[1]
@@ -1273,13 +1817,31 @@ try {
         $nativeOutsideAppPostRejected,
         $nativeBmClickVerified
     ) -notcontains $false
+    if ($IncludeChromium -and -not $chromiumSkipped) {
+        # Only the non-skipped Chromium section can contribute a pass/fail; a skipped
+        # section (no browser) leaves the six flags false without failing the run.
+        $chromiumReportedChecks = @(
+            $chromiumContentAreaOpaque,
+            $chromiumTypeTextNewMessage,
+            $chromiumSetValueRejected,
+            $chromiumAppPostLanded,
+            $chromiumGlobalOcclusionFailClosed,
+            $chromiumCoordinateLanding,
+            $chromiumCoordinateScaleMatched
+        )
+        # The opt-in physical branch participates only when the operator ran it.
+        if ($null -ne $chromiumGlobalPhysicalFailClosed) {
+            $chromiumReportedChecks += $chromiumGlobalPhysicalFailClosed
+        }
+        $allReportedChecksPassed = $allReportedChecksPassed -and (($chromiumReportedChecks -notcontains $false) -and ($chromiumReportedChecks -notcontains $null))
+    }
     Assert-Condition $allReportedChecksPassed 'One or more computed smoke result flags did not pass.'
 
     $artifactReference = $null
     if ($KeepArtifacts) {
         $artifactReference = $runRoot
     }
-    [pscustomobject]@{
+    $result = [pscustomobject]@{
         ok = $allReportedChecksPassed
         runnerPowerShell = [string]$PSVersionTable.PSVersion
         fixtureHost = [System.IO.Path]::GetFileName($script:FixtureHostPathResolved)
@@ -1316,8 +1878,28 @@ try {
         nativeOutsideAppPostRejected = $nativeOutsideAppPostRejected
         nativeBmClick = ('clicks=' + $nativeAfter.clicks + '; down=' + $nativeAfter.buttonDown + '; up=' + $nativeAfter.buttonUp)
         artifacts = $artifactReference
-    } | ConvertTo-Json -Depth 10 -Compress
-} finally {
+    }
+    if ($IncludeChromium) {
+        # R6: appended only on request, so the default key set stays byte-identical
+        # to the baseline (research/baseline-runner-keys.json).
+        [void]($result | Add-Member -NotePropertyName chromiumContentAreaOpaque -NotePropertyValue $chromiumContentAreaOpaque -PassThru)
+        [void]($result | Add-Member -NotePropertyName chromiumTypeTextNewMessage -NotePropertyValue $chromiumTypeTextNewMessage -PassThru)
+        [void]($result | Add-Member -NotePropertyName chromiumSetValueRejected -NotePropertyValue $chromiumSetValueRejected -PassThru)
+        [void]($result | Add-Member -NotePropertyName chromiumAppPostLanded -NotePropertyValue $chromiumAppPostLanded -PassThru)
+        [void]($result | Add-Member -NotePropertyName chromiumGlobalOcclusionFailClosed -NotePropertyValue $chromiumGlobalOcclusionFailClosed -PassThru)
+        [void]($result | Add-Member -NotePropertyName chromiumGlobalPhysicalFailClosed -NotePropertyValue $chromiumGlobalPhysicalFailClosed -PassThru)
+        [void]($result | Add-Member -NotePropertyName chromiumCoordinateLanding -NotePropertyValue $chromiumCoordinateLanding -PassThru)
+        [void]($result | Add-Member -NotePropertyName chromiumCoordinateScale -NotePropertyValue $chromiumCoordinateScale -PassThru)
+        [void]($result | Add-Member -NotePropertyName chromiumCoordinateAnchor -NotePropertyValue $chromiumCoordinateAnchor -PassThru)
+        [void]($result | Add-Member -NotePropertyName chromiumDevicePixelRatio -NotePropertyValue $chromiumDevicePixelRatio -PassThru)
+        [void]($result | Add-Member -NotePropertyName chromiumHost -NotePropertyValue $chromiumHost -PassThru)
+        [void]($result | Add-Member -NotePropertyName chromiumPointerWitness -NotePropertyValue $chromiumPointerWitness -PassThru)
+        [void]($result | Add-Member -NotePropertyName chromiumPointerWitnessNote -NotePropertyValue $chromiumPointerWitnessNote -PassThru)
+        [void]($result | Add-Member -NotePropertyName chromiumSkipped -NotePropertyValue $chromiumSkipped -PassThru)
+        [void]($result | Add-Member -NotePropertyName chromiumSkippedReason -NotePropertyValue $chromiumSkippedReason -PassThru)
+    }
+    $result | ConvertTo-Json -Depth 10 -Compress
+    } finally {
     foreach ($target in $fixtures) {
         if ($null -ne $target.Process -and -not $target.Process.HasExited) {
             try {
@@ -1327,6 +1909,9 @@ try {
             }
         }
     }
+    # The Chromium fixture's browser outlives a hard-killed fixture host, so the run
+    # cleans its own fixture browsers here instead of relying on the fixture's finally.
+    [void](Remove-StaleChromiumFixtureBrowsers)
     if (-not $KeepArtifacts -and (Test-Path -LiteralPath $runRoot)) {
         Remove-Item -LiteralPath $runRoot -Recurse -Force
     }

@@ -31,6 +31,62 @@ For deterministic smoke runs, both scripts accept `-InstanceName`, `-ReadyPath`,
 
 `native-pointer-bench.ps1` exposes a WinForms `BUTTON`, editable native text box, and `TrackBar`. The button reports `Click`, mouse-down, and mouse-up counters. The native `app_post` path uses the button's `BM_CLICK` message and should raise the `Click` counter without falling back to global input; the native text box verifies the focused child-HWND `type_text` path without UIA fallback authorization, including appending to a pre-existing value.
 
+## Chromium Fixture
+
+`chromium-test-page.ps1` is the third fixture target and the only one with a real Chromium/Electron content area. It serves its page from a loopback `HttpListener` and opens it with `--app=<url>` plus its own `--user-data-dir` in a throwaway temp profile, so the page always runs in a browser instance the fixture owns and never as a tab of a browser that is already running. The page reports its own geometry (CSS rectangles, `devicePixelRatio`, `screenX`/`screenY`) back through `POST /event`, which is what lets the runner derive physical click points from measurements instead of from a hard-coded DPI factor.
+
+```powershell
+pwsh.exe -NoProfile -ExecutionPolicy Bypass -File .\fixtures\chromium-test-page.ps1 -InstanceName Chrome
+```
+
+It accepts the same `-InstanceName`, `-ReadyPath`, `-StatePath`, `-Left`, `-Top` protocol as the other fixtures, plus `-Width`, `-Height`, `-Port`, `-BrowserPath`, `-ReadyTimeoutSeconds`, `-RendererAccessibility`, and `-KeepArtifacts`. Without `-BrowserPath` it resolves `%ProgramFiles%\Google\Chrome\Application\chrome.exe`, `%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe`, then the same two roots for `msedge.exe`; when none of them exist it throws, so a silently mis-targeted run is impossible.
+
+### Chromium core-surface smoke
+
+The runner drives this fixture through `-IncludeChromium` (off by default):
+
+```powershell
+pwsh.exe -NoProfile -ExecutionPolicy Bypass -File .\fixtures\run-interactive-smoke.ps1 -IncludeChromium
+```
+
+- `-IncludeChromium` appends the Chromium result keys to the result JSON. Without it the key set is unchanged. Progress and skip lines are written to stderr, so stdout stays a single machine-parseable JSON object either way.
+- `-ChromiumBrowserPath <chrome.exe|msedge.exe>` overrides browser resolution. The path is validated as given: an explicit path that does not exist **skips** the section rather than falling back to a discovered browser.
+- `-ChromiumRendererAccessibility` passes `--force-renderer-accessibility` to the fixture. Chromium normally keeps its renderer accessibility tree off, so the page contributes no nodes to the tree; forcing it on makes the page's own controls appear, which is the falsification switch for the first assertion below (that assertion must turn false when this flag is set).
+- No Chromium-family browser found (or an unusable `-ChromiumBrowserPath`): the section prints a skip line, sets `chromiumSkipped`/`chromiumSkippedReason`, leaves the remaining Chromium keys `false`/empty, and the run still exits 0.
+
+The section stays opt-in because it needs a real browser install and an interactive desktop; neither is available to the repository's default test surface.
+
+What it covers against a real browser:
+
+1. `chromiumContentAreaOpaque` — the content area contributes no node an element-targeted action could reach: no element carries the page's own control texts (`click target`, `text input`) and no content-control type (`ControlType.Edit`/`ControlType.Document`) carries a frame. The window frame (title bar, `最小化`/`最大化`/`关闭`, renderer panes) and the frameless address-bar `Edit` are expected to be present.
+2. `chromiumTypeTextNewMessage` — `type_text` on that content area returns the exact bounded message the runtime publishes, byte for byte.
+3. `chromiumSetValueRejected` — `set_value` against a real non-settable window element returns `Cannot set a value for an element that is not settable` with the page's `inputEvents` counter unchanged, and a bare legacy element index is still rejected as an expired target (`Target changed; call get_app_state again.`).
+4. `chromiumAppPostLanded` — with explicit coordinates, `click_method='app_post'` lands on the page through the window-message path (page `clicks` increments and the event reports `target='#click-target'`), and `click_method='auto'` reproduces it. WPF's app-post capability error is deliberately **not** expected here: Chromium is a native HWND target, so a landed click is the observable result.
+5. `chromiumGlobalOcclusionFailClosed` — with no authorization present, `click_method='global'` is refused with `Interactive Windows input is disabled by default...` before any injection, and the page observes no click.
+6. `chromiumCoordinateLanding` — closed-loop coordinate calibration, described below.
+
+### Chromium coordinates
+
+The fixture process and the runtime do not have to report the same coordinate space, and which space the runtime reports can differ between runs (measured: a run where the fixture state said bounds `40,760 x 900x680` while the runtime snapshot said `90,1710 x 2025x1530`). Mixing them pushes the effective click point off the physical screen, where the runtime rejects it as `Target changed`. The section therefore derives every point from `snapshot.windowBounds` alone — the value the runtime itself adds to explicit `x`/`y` — and uses the fixture state only for page-reported quantities (CSS rectangles, `devicePixelRatio`, counters), never for an origin.
+
+The runner does not trust the scaling either. It sends the window centre through `click_method='app_post'`, reads the `clientX`/`clientY` the page reports for that click (a click on the target and a page-level click both count), and derives the anchor `anchor = sent - reported x devicePixelRatio`. A second probe adds a known 120-unit offset and measures the effective scale, which must match the page's `devicePixelRatio` within 0.1; that assertion is what makes a changed coordinate space fail loudly instead of silently mis-landing. The final click re-aims with the anchor and requires the page's reported point to match the target centre it reports for that click within 4 CSS pixels. `chromiumCoordinateAnchor` (in runtime units relative to `snapshot.windowBounds`), `chromiumCoordinateScale`, and `chromiumDevicePixelRatio` are written into the result, so the numbers are data instead of assumptions.
+
+The apparent constant offset between the computed origin and the page's reported client point is now explained: explicit `x`/`y` are **window-relative** (the runtime adds `windowBounds` itself), and the anchor the calibration recovers — `15.75,65.50` in runtime units on this machine — is the content-area origin, meaning the point the browser actually treats as its client origin. An `--app` window draws its own title bar inside the OS client area, so the fixture's own `clientOrigin` is the window client area and sits ~66 physical units above the page viewport at 225% scaling. The earlier "unexplained offset" was an artifact of feeding a screen point where a window-relative point belongs. One observation from the same measurement round is still open: a single UIA tree reporting logical and physical quantities side by side (a child pane claiming `1997x1516` while the same window reports `900x680` and the page viewport is `873x601` physical). That is recorded in `research/chromium-runtime-measured-facts.md` of the `09-23-chromium-core-fixture` task rather than worked around here.
+
+### Physical pointer input (opt-in, and only while you are away)
+
+Test discipline for this fixture, after a real incident (recorded in `research/incident-physical-pointer-hijack.md`): the smoke runner injects no physical pointer or keyboard input on its default path, and the Chromium section refuses to start at all when `OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT` or `OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS` is already present in the environment.
+
+This is test discipline, **not** a product limitation. The runtime's `global` pointer and keyboard injection paths are supported capabilities and are unchanged; what the runner refuses to do is take over the operator's mouse as a side effect of an ordinary verification run.
+
+The occluded-physical-click case is implemented but stays inert unless the operator opts in:
+
+```powershell
+$env:OCU_FIXTURE_ALLOW_PHYSICAL_POINTER = '1'
+```
+
+**Running with that flag really moves your mouse and can take foreground focus**, because that is exactly what the physical path does. Run it only when you are away from the machine. Without the flag the runner prints a skip line, `chromiumGlobalPhysicalFailClosed` stays `null`, and the run still passes. With it, the branch covers the target point with an unrelated window, requires the physical click to fail closed on occlusion, and requires the cursor position to be unchanged. The pointer witness in the result is a read-only `GetCursorPos` sample before and after the section: an operator using the machine moves the cursor during any run, so it is evidence for a human reader and never a pass criterion.
+
 ## Repeatable Smoke
 
 Run the source-owned runner from `apps/OpenComputerUseWindows`:
