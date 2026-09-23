@@ -4,13 +4,25 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# Files this repository maintains itself and must always carry.
 required_files=(
   ".gitignore"
-  ".editorconfig"
   ".gitattributes"
   "CODEOWNERS"
   "CONTRIBUTING.md"
   "SECURITY.md"
+  ".github/workflows/release.yml"
+  "scripts/check-action-pinning.sh"
+)
+
+# Governance files upstream/main is missing as well (it ships only
+# .github/workflows/release.yml, and neither .editorconfig nor .markdownlint.json
+# exists there, so a hard requirement for this set cannot be satisfied by anyone).
+# This fork does not publish the GitHub governance workflows either, so their
+# absence is reported without failing the check.
+advisory_files=(
+  ".editorconfig"
+  ".markdownlint.json"
   ".github/PULL_REQUEST_TEMPLATE.md"
   ".github/dependency-review-config.yml"
   ".github/ISSUE_TEMPLATE/bug_report.yml"
@@ -19,10 +31,7 @@ required_files=(
   ".github/workflows/ci.yml"
   ".github/workflows/docs-check.yml"
   ".github/workflows/repo-hygiene.yml"
-  ".github/workflows/release.yml"
   ".github/workflows/supply-chain-security.yml"
-  ".markdownlint.json"
-  "scripts/check-action-pinning.sh"
 )
 
 failed=0
@@ -31,6 +40,12 @@ for path in "${required_files[@]}"; do
   if [[ ! -f "${repo_root}/${path}" ]]; then
     echo "缺少必要文件: ${path}"
     failed=1
+  fi
+done
+
+for path in "${advisory_files[@]}"; do
+  if [[ ! -f "${repo_root}/${path}" ]]; then
+    echo "缺少（建议，不致命）: ${path}"
   fi
 done
 

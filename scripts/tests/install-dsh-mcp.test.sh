@@ -11,6 +11,9 @@ installer="${repo_root}/scripts/install-dsh-mcp.sh"
 
 work_dir="$(mktemp -d)"
 cleanup() {
+  # The Windows fixture probes from work_dir, so the trap must leave it first:
+  # Windows refuses to delete a directory that is a live process' working directory.
+  cd "${repo_root}" || true
   rm -rf "${work_dir}"
 }
 trap cleanup EXIT
@@ -25,10 +28,34 @@ pass() {
 }
 
 fixture="${repo_root}/scripts/tests/fixtures/open-computer-use-mcp.mjs"
-fake_command="${work_dir}/Open Computer Use (Dev).app/Contents/MacOS/OpenComputerUse"
-mkdir -p "$(dirname "${fake_command}")"
-cp "${fixture}" "${fake_command}"
-chmod +x "${fake_command}"
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) is_windows=1 ;;
+  *) is_windows=0 ;;
+esac
+if [[ "${is_windows}" -eq 1 ]]; then
+  # Windows cannot start the extension-less macOS bundle below with CreateProcess,
+  # and the installer probes the registered command with a bare spawn, which node
+  # refuses for a .cmd/.bat without a shell (spawn EINVAL, thrown synchronously).
+  # So the fixture is a real PE: node, copied under the name of the installed
+  # command, with the same MCP fixture exposed as the entry script "mcp". The probe
+  # passes only the argument "mcp", resolved against its working directory, hence
+  # the cd below.
+  cp "$(command -v node)" "${work_dir}/OpenComputerUse.exe"
+  cp "${fixture}" "${work_dir}/mcp.js"
+  printf '{ "type": "module" }\n' > "${work_dir}/package.json"
+  chmod +x "${work_dir}/OpenComputerUse.exe"
+  cd "${work_dir}"
+  # MSYS rewrites POSIX arguments such as /tmp/... into C:/... before handing them
+  # to node, so a /tmp-based path would reach the probe and the DSH profile in a
+  # different spelling than the one bash compares against. A \\?\ path is passed
+  # through untouched, which keeps the recorded command byte-identical.
+  fake_command="//?/$(cygpath -m "${work_dir}")/OpenComputerUse.exe"
+else
+  fake_command="${work_dir}/Open Computer Use (Dev).app/Contents/MacOS/OpenComputerUse"
+  mkdir -p "$(dirname "${fake_command}")"
+  cp "${fixture}" "${fake_command}"
+  chmod +x "${fake_command}"
+fi
 
 dsh_home="${work_dir}/dsh"
 profile_dir="${dsh_home}/profiles/web"

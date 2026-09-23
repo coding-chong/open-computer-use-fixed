@@ -15,6 +15,12 @@ import {
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
+// makePackage() builds its native executable as an extension-less POSIX shebang
+// script. Windows CreateProcess cannot execute that, so spawn() fails with
+// ENOENT; the behaviours are covered on win32 by the real-native fixture in
+// open-computer-use-cli.windows.test.mjs.
+const POSIX_NATIVE_SKIP = "POSIX shebang fixture (dist/fake-native) cannot be executed by CreateProcess on Windows; Windows coverage lives in open-computer-use-cli.windows.test.mjs";
+
 function captureStream() {
   const stream = new PassThrough();
   let value = "";
@@ -117,6 +123,10 @@ test("main reports structured capabilities without starting native MCP", async (
 });
 
 test("ocu js executes positional, stdin, and file source", async t => {
+  if (process.platform === "win32") {
+    t.skip(POSIX_NATIVE_SKIP);
+    return;
+  }
   const fixture = makePackage();
   t.after(fixture.cleanup);
   const cases = [
@@ -146,6 +156,10 @@ test("ocu js executes positional, stdin, and file source", async t => {
 });
 
 test("ocu js returns a non-zero exit when evaluation times out", async t => {
+  if (process.platform === "win32") {
+    t.skip(POSIX_NATIVE_SKIP);
+    return;
+  }
   const fixture = makePackage();
   t.after(fixture.cleanup);
   const output = captureStream();
@@ -162,6 +176,10 @@ test("ocu js returns a non-zero exit when evaluation times out", async t => {
 });
 
 test("ocu repl preserves bindings and reset discards them", async t => {
+  if (process.platform === "win32") {
+    t.skip(POSIX_NATIVE_SKIP);
+    return;
+  }
   const fixture = makePackage();
   t.after(fixture.cleanup);
   const input = new PassThrough();
