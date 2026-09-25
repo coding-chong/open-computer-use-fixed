@@ -4,7 +4,8 @@ param(
     [string]$StatePath = "",
     [int]$Left = -1,
     [int]$Top = -1,
-    [switch]$AllowOffscreenPlacement
+    [switch]$AllowOffscreenPlacement,
+    [switch]$Topmost
 )
 
 $ErrorActionPreference = "Stop"
@@ -132,6 +133,13 @@ if (($Left -ge 0 -and $Top -ge 0) -or $AllowOffscreenPlacement) {
     $window.WindowStartupLocation = [System.Windows.WindowStartupLocation]::Manual
     $window.Left = $Left
     $window.Top = $Top
+}
+# A cover window has to own its topmost status itself. A cross-process
+# SetWindowPos(HWND_TOPMOST) from the runner is accepted and returns true but does
+# not change the z-order, so a cover raised that way stays under the app it is
+# supposed to cover and the occlusion test would silently measure nothing.
+if ($Topmost) {
+    $window.Topmost = $true
 }
 
 $autoButton = $window.FindName('autoButton')

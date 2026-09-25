@@ -1584,23 +1584,64 @@ try {
                 # about the coordinate space, the cover lands elsewhere, the check fails
                 # and the branch refuses to inject rather than clicking into whatever is
                 # actually there.
+                #
+                # The runtime makes its own thread per-monitor DPI aware (runtime.ps1
+                # calls SetThreadDpiAwarenessContext(-4)) so that UIA, window bounds and
+                # SendInput share physical desktop coordinates. This runner has to match
+                # that space before it places the cover and asks who owns the point: a
+                # system-DPI-aware or DPI-unaware host is virtualized on a monitor whose
+                # DPI differs from the system DPI, and there SetWindowPos would put the
+                # cover somewhere other than the point the runtime clicks while
+                # ChildWindowFromPointEx - virtualized exactly the same way - still named
+                # the cover the owner of the point. The guard would pass and the physical
+                # click would land unoccluded wherever that point really is.
+                if (-not ('OcuSmokeDpi' -as [type])) {
+                    Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class OcuSmokeDpi { [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr dpiContext); [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left; public int Top; public int Right; public int Bottom; } [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect); [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr hWnd, int index); public static void PerMonitorV2() { SetThreadDpiAwarenessContext(new IntPtr(-4)); } public static int[] Rect(IntPtr hWnd) { RECT rect; if (!GetWindowRect(hWnd, out rect)) { return null; } return new int[] { rect.Left, rect.Top, rect.Right - rect.Left, rect.Bottom - rect.Top }; } public static int Ex(IntPtr hWnd) { return GetWindowLong(hWnd, -20); } }'
+                }
+                [OcuSmokeDpi]::PerMonitorV2()
                 $chromiumPhysicalPointX = [double]$chromiumSnapshot.windowBounds.x + $chromiumTargetRelX
                 $chromiumPhysicalPointY = [double]$chromiumSnapshot.windowBounds.y + $chromiumTargetRelY
                 $chromiumCoverLeft = [int][math]::Round($chromiumPhysicalPointX - 120)
                 $chromiumCoverTop = [int][math]::Round($chromiumPhysicalPointY - 120)
-                $chromiumCoverTarget = Start-Fixture 'wpf-test-bench.ps1' 'ChromiumCover' $chromiumCoverLeft $chromiumCoverTop $script:FixtureHostPathResolved
+                $chromiumCoverTarget = Start-Fixture 'wpf-test-bench.ps1' 'ChromiumCover' $chromiumCoverLeft $chromiumCoverTop $script:FixtureHostPathResolved $false @('-Topmost')
                 $chromiumCoverState = Wait-FixtureReady $chromiumCoverTarget
-                # Cover the exact target point and raise the cover above the browser.
-                # SWP_NOZORDER must be absent here or HWND_TOPMOST would be ignored and
-                # the "occluded" click would land on the browser instead of failing
-                # closed. SWP_NOACTIVATE keeps the cover from taking foreground.
-                [void][OcuSmokeWindow]::SetWindowPos([IntPtr]$chromiumCoverState.hwnd, [IntPtr](-1), $chromiumCoverLeft, $chromiumCoverTop, 900, 680, 0x0001 -bor 0x0002 -bor 0x0010 -bor 0x0040)
+                # The fixture interprets -Left/-Top as WPF device-independent units, so its
+                # creation-time position is NOT the physical rect requested below: on a 225%
+                # monitor -Left 643 lands at physical x 1447 (measured). The SetWindowPos call
+                # below is what actually puts the cover on the target point, and the identity
+                # round-trip after it is what proves the physical space agrees. Both spaces are
+                # logged here so a future space mismatch is visible in the log instead of only
+                # in a failure message.
+                Write-ChromiumNotice ('[chromium] 5b cover creation: requested=' + $chromiumCoverLeft + ',' + $chromiumCoverTop + ' fixtureStateDIP=' + $chromiumCoverState.windowBounds.x + ',' + $chromiumCoverState.windowBounds.y + ' ' + $chromiumCoverState.windowBounds.width + 'x' + $chromiumCoverState.windowBounds.height + ' pid=' + $chromiumCoverState.pid)
+                # Cover the exact target point. SWP_NOMOVE and SWP_NOSIZE must both be
+                # absent or the X/Y/cx/cy below would be ignored and the cover would stay
+                # wherever the fixture host put it, so the point would never be covered.
+                # SWP_NOACTIVATE keeps the cover from taking foreground. The cover is
+                # already topmost because the fixture created it that way: a cross-process
+                # SetWindowPos(HWND_TOPMOST) returns true without changing the z-order, and
+                # SWP_NOZORDER here would pin that in place.
+                [void][OcuSmokeWindow]::SetWindowPos([IntPtr]$chromiumCoverState.hwnd, [IntPtr](-1), $chromiumCoverLeft, $chromiumCoverTop, 900, 680, 0x0010 -bor 0x0040)
                 Start-Sleep -Milliseconds 300
+                # Identity round-trip in that same space. A virtualized placement reports
+                # back a scaled rect, so this turns a silent space mismatch into a refusal
+                # before any input is injected, instead of a click at an unknown point.
+                $chromiumCoverRect = [OcuSmokeDpi]::Rect([IntPtr]$chromiumCoverState.hwnd)
+                $chromiumCoverRectMatches = (
+                    $null -ne $chromiumCoverRect -and
+                    [math]::Abs([int]$chromiumCoverRect[0] - $chromiumCoverLeft) -le 4 -and
+                    [math]::Abs([int]$chromiumCoverRect[1] - $chromiumCoverTop) -le 4 -and
+                    [math]::Abs([int]$chromiumCoverRect[2] - 900) -le 4 -and
+                    [math]::Abs([int]$chromiumCoverRect[3] - 680) -le 4
+                )
+                Assert-Condition $chromiumCoverRectMatches ('The cover reported rect ' + ($chromiumCoverRect -join ',') + ' for a requested placement of ' + $chromiumCoverLeft + ',' + $chromiumCoverTop + ' 900x680, so the runner and the runtime disagree about the coordinate space and the physical branch refuses to inject.')
+                $chromiumCoverExStyle = [OcuSmokeDpi]::Ex([IntPtr]$chromiumCoverState.hwnd)
+                Assert-Condition (($chromiumCoverExStyle -band 0x8) -ne 0) ('The cover window is not topmost (extended style 0x' + $chromiumCoverExStyle.ToString('X8') + '), so it does not occlude the target point and the physical branch refuses to inject.')
                 # Read-only proof that the cover owns the point. Without it the branch
                 # could inject a real click into whatever window happens to be there,
                 # which is exactly the accident this opt-in exists to prevent.
                 $chromiumCoverOwner = [OcuSmokePointOwner]::OwnerPid([int][math]::Round($chromiumPhysicalPointX), [int][math]::Round($chromiumPhysicalPointY))
                 Assert-Condition ($chromiumCoverOwner -eq [int]$chromiumCoverState.pid) ('The cover window does not own the target point (owner pid ' + $chromiumCoverOwner + '), so the physical branch refuses to inject.')
+                Write-ChromiumNotice ('[chromium] 5b guard chain: requestedPoint=' + [int][math]::Round($chromiumPhysicalPointX) + ',' + [int][math]::Round($chromiumPhysicalPointY) + ' requestedRect=' + $chromiumCoverLeft + ',' + $chromiumCoverTop + ' 900x680 observedRect=' + ($chromiumCoverRect -join ',') + ' exStyle=0x' + $chromiumCoverExStyle.ToString('X8') + ' ownerPid=' + $chromiumCoverOwner + ' coverPid=' + $chromiumCoverState.pid + ' identityOk=' + $chromiumCoverRectMatches)
                 $chromiumPhysicalPointerBefore = Get-InteractiveCursorWitness
                 $chromiumPhysicalClicksBefore = [int](Read-State $chromiumTarget.StatePath).clicks
                 $chromiumPhysicalEnvironmentNames = @('OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT', 'OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS')
